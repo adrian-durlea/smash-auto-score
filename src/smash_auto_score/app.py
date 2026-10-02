@@ -22,6 +22,7 @@ from .integrations import (
     TSHWebAdapter,
 )
 from .store import Store
+from .telemetry import ProcessSampler
 from .vision import ROI, Calibration, TesseractOCR, dominant_color
 from .worker import (
     VideoWorker,
@@ -36,6 +37,7 @@ settings = Settings()
 controller = Controller(DemoTSHAdapter() if settings.demo else TSHWebAdapter(settings.tsh_url, settings.tsh_scoreboard),
                         Store(settings.database_path), settings)
 video_worker: VideoWorker | None = None
+process_sampler = ProcessSampler()
 if settings.recorded_video:
     video_worker = VideoWorker(RecordedVideoSource(settings.recorded_video), controller,
                                Path(settings.calibration_path), settings.frame_fps,
@@ -124,6 +126,10 @@ class ReplayObservation(BaseModel):
     result_screen: bool = False
     winner: Slot | None = None
     winner_confidence: float = 0
+    result_confidence: float = 0
+    hud_visible: bool = False
+    winner_evidence: list[str] = []
+    end_evidence: list[str] = []
 
 
 async def _do(coro):
@@ -147,6 +153,9 @@ async def status():
     result["video"] = {"connected": video_worker.connected if video_worker else False,
                        "source": settings.recorded_video or settings.obs_source or None,
                        "fps": settings.frame_fps, "error": video_worker.error if video_worker else "No source configured"}
+    result["performance"] = ({**process_sampler.sample(), **video_worker.telemetry()}
+                             if settings.performance_telemetry_enabled and video_worker else
+                             process_sampler.sample() if settings.performance_telemetry_enabled else {})
     return result
 
 
@@ -260,7 +269,8 @@ class CalibrationRequest(BaseModel):
 @app.put("/api/calibration")
 async def update_calibration(body: CalibrationRequest):
     allowed = {"p1_tag", "p2_tag", "p1_hud", "p2_hud", "p1_character", "p2_character",
-               "gameplay", "game_set", "result", "winner"}
+               "gameplay", "game_set", "result", "winner", "placement", "winner_badge",
+               "loser_badge"}
     if not set(body.rois).issubset(allowed):
         raise HTTPException(400, "Unknown ROI name")
     for roi in body.rois.values():
@@ -288,6 +298,10 @@ async def test_region(name: str):
         slot = Slot.P1 if name.startswith("p1") else Slot.P2
         character, confidence = video_worker.detector.characters.detect(crop, slot)
         return {"character": character, "confidence": confidence}
+    if name in {"placement", "winner_badge", "loser_badge"}:
+        found, visual_slot, confidence, evidence = video_worker.detector.winner.detect_visual(frame, calibration)
+        return {"result_screen": found, "winner": visual_slot.value if visual_slot else None,
+                "confidence": confidence, "evidence": evidence}
     try:
         value, confidence = await asyncio.to_thread(TesseractOCR().read, crop)
         return {"text": value, "confidence": confidence}
@@ -304,7 +318,20 @@ async def arm(armed: bool):
 
 @app.post("/api/score/{side}")
 async def manual_score(side: Side):
-    return {"applied": await _do(controller.manual_score(side))}
+    applied = await _do(controller.manual_score(side))
+    if applied and video_worker and video_worker.winner_diagnostics and video_worker.latest_frame:
+        image = cv2.imdecode(np.frombuffer(video_worker.latest_frame, np.uint8), cv2.IMREAD_COLOR)
+        if image is not None:
+            mapping = controller.mapping.p1_is_left
+            actual: Slot | None = None
+            if mapping is not None:
+                actual = Slot.P1 if ((side == Side.LEFT) == mapping) else Slot.P2
+            kind = f"manual-{actual.value.lower()}" if actual else "correction"
+            try:
+                video_worker.winner_diagnostics.record(kind, image, actual=actual, actual_side=side)
+            except OSError as exc:
+                logging.getLogger(__name__).warning("Winner diagnostic capture failed: %s", exc)
+    return {"applied": applied}
 
 
 @app.post("/api/undo")

@@ -52,4 +52,3 @@ class WinnerDiagnostics:
         metadata["actual_side"] = actual_side.value if actual_side else None
         image_path.with_suffix(".json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         return image_path
-

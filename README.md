@@ -8,7 +8,7 @@ Auto score starts **disarmed**. Next set mode starts at **SUGGEST**. An automati
 
 After set completion, candidate refresh waits 15 seconds by default. AUTO set loading additionally requires fresh active game observations after that delay, plus the configured confidence and margin. The operator can dismiss a suggestion for the current set.
 
-The winner detector accepts only explicit `P1 WINS` or `P2 WINS` text in a calibrated winner region at very high OCR confidence. Typical Smash result screens may not show that text, so out of the box auto score remains inert while manual scoring and replayed observations work. This is a functioning operator MVP and detection framework, not a claim of fully autonomous broadcast scoring.
+The winner detector now uses the first-place results layout seen in the supplied Ultimate footage. It checks a gold placement region, a red or blue first-place slot badge, and the opposite-colored second-place badge. Two matching samples are required for both game-end confirmation and winner identification. Winner identity is only `P1` or `P2`; the mapping engine translates that slot to the competitor. A partial or conflicting layout yields unknown and leaves manual scoring available. Explicit OCR win text remains an optional fallback. Automation still starts disarmed. The supplied footage is one broadcast layout, so this is not evidence of tournament readiness on other overlays or aspect ratios.
 
 ## Architecture
 
@@ -29,7 +29,7 @@ flowchart LR
   Sets --> UI
 ```
 
-The two mapping hypotheses are `P1 = TSH left` and `P1 = TSH right`. Tag, HUD color, character history, and previous mapping provide separate evidence. One strong tag can map both players. Random tags provide no identity evidence and do not block other signals.
+The two mapping hypotheses are `P1 = TSH left` and `P1 = TSH right`. Tag, HUD color, character history, and previous mapping provide separate evidence. One strong tag can map both players. Random tags provide no identity evidence and do not block other signals. The game state machine requires stable gameplay HUD observations before starting a game, confirms results temporally, and locks a scored game until fresh gameplay and the post-game lockout permit another generation. The persisted score event ID also prevents duplicate writes.
 
 ## Install and run
 
@@ -75,6 +75,18 @@ python -m smash_auto_score.analyze_video 'C:\path\to\recording.mp4' --start 779 
 
 The CSV lists the stable detected character or `unknown` per slot and sample. Inspect transitions and any wrong labels, then adjust regions/templates before using the observations. On the supplied 1920×1080 recording, local templates captured at 13:20 and 16:00 were replayed at 10-second intervals from 13:20 to 20:00. Before the character switch, the detector labeled Donkey Kong in 6/11 P1 samples and Little Mac in 8/11 P2 samples. After the switch, it labeled Donkey Kong in 21/25 P1 samples and Joker in 17/25 P2 samples. The remaining samples were `unknown`; all ten portrait observations from 15:10 to 15:50 were unknown during the transition. There were no wrong labels among these 72 pre/post portrait samples. This is one broadcast layout with three character templates, not validation across the full roster or other layouts.
 
+### Game-end and winner replay
+
+The result detector uses three normalized regions: `placement`, `winner_badge`, and `loser_badge`. Defaults are calibrated to the supplied 16:9 recording; adjust them in the dashboard for another capture. The first-place and second-place badges must disagree in color before a winner is reported. This slot-based method also works for dittos without relying on character identity. Final-stock tracking was investigated but is not used as a scoring signal because stock icons are often obscured. Timeout endings remain unvalidated.
+
+```powershell
+python -m smash_auto_score.analyze_video 'C:\path\to\recording.mp4' --mode games --start 00:14:50 --end 00:15:15 --step 0.2 --output diagnostics/games.json
+```
+
+The command writes JSON and CSV game summaries. At 5 FPS, three labeled windows in the supplied recording ended at 15:07.4 (P1), 20:49.6 (P1), and 44:58.6 (P2). All three known ends were detected and all three winner slots were correct; there were zero wrong winners and zero extra end events in those 85 seconds of selected windows. Confirmation took about 0.2 seconds after the first qualifying result frame. At 2.5 FPS, the brief 20:49 result was missed. In a 35-second offline P2 replay, average CV processing was 2.06 ms/frame (winner logic 0.71 ms), process RAM was 76.7 MB, and process CPU averaged 341.5% of one core; random video seeks and decode dominate that CPU figure. Live OBS and TSH performance has not been measured. These are three selected games, not a broad accuracy estimate. Local PNG templates and replay outputs are ignored by Git.
+
+Set `SAS_WINNER_DIAGNOSTICS_ENABLED=true` to collect candidate, confirmed, result, unknown, and manually labeled frames plus calibrated crops and JSON evidence in `diagnostics/winner`. A manual score that disagrees with a predicted mapped winner logs `winner_prediction_error`. The dashboard shows end/winner evidence, mapped competitor, score gate, and lightweight performance measurements. `SAS_GAME_END_CONFIRMATION_FRAMES`, `SAS_WINNER_CONFIRMATION_FRAMES`, `SAS_NEW_GAME_CONFIRMATION_FRAMES`, and `SAS_POST_GAME_LOCKOUT_SECONDS` tune temporal behavior. [The rehearsal checklist](docs/rehearsal.md) covers live TSH/OBS verification and failure cases.
+
 ## Tests and development
 
 ```powershell
@@ -83,14 +95,14 @@ python -m ruff check src tests
 python -m mypy src/smash_auto_score --ignore-missing-imports
 ```
 
-SQLite stores score transactions and event logs. Demo tests cover one tag, random tags, color tolerance, character discrimination, conflicting signals, idempotency, undo, and set completion. Provider tests cover parsing, caching, ID handling, and failure behavior with a mock HTTP transport. Detector tests cover consensus, switching, reset, and no-template behavior. External integrations need rehearsal footage and live service verification. Avoid relying on the generic winner detector for real tournament scoring before collecting labeled frame sequences and measuring false positives.
+SQLite stores score transactions and event logs. Tests cover mapping, state transitions, winner layouts, duplicate prevention, score undo, Supermajor failure behavior, TSH route mocks, OBS screenshots, and disconnects. Mock tests do not prove compatibility with an installed TSH or OBS version. No running local TSH or OBS instance was available for this milestone. Do not arm automatic scoring at a live event before a full rehearsal on its actual capture layout.
 
 ## Roadmap
 
-1. Capture and label tournament game start, end, results, and winner frames.
-2. Build and validate a slot winner detector from calibrated results cues.
-3. Test TSH 5.x adapter on a local installation and document version differences.
-4. Expand candidate ranking with stable player IDs, station assignments, and observed character distributions.
+1. Label more winner footage across stages, skins, overlays, SDs, and timeouts; measure abstention and false decisions on a held-out set.
+2. Test the TSH adapter on the installed version with a disposable scoreboard and document route differences.
+3. Rehearse OBS capture, disconnect/reconnect, score verification, undo, set completion, and next-set loading end to end.
+4. Expand character templates and candidate ranking only after the scoring path is validated.
 
 ## Integration references
 
