@@ -7,4 +7,6 @@ __pycache__/
 *.pyc
 *.db
 diagnostics/
+config/character_templates/
+config/calibration.json
 *.egg-info/

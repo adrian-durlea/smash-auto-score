@@ -57,11 +57,23 @@ Set `SAS_DEMO=false`, `SAS_TSH_URL`, and `SAS_TSH_SCOREBOARD`. The adapter targe
 
 TSH supplies candidate sets. Optionally set `SAS_STARTGG_TOKEN`, `SAS_STARTGG_TOURNAMENT_SLUG`, and `SAS_STARTGG_STREAM_NAME` to add the official Start.gg GraphQL stream queue as a strong assignment signal. Without these values, the candidate ranker uses observations and TSH candidates only. No live Start.gg credentials were available for validation.
 
-Supermajor enrichment is **not active**. Public access to a stable player character statistics API could not be confirmed. Local aliases and character distributions can be saved per loaded player in the dashboard and cached in SQLite; the character detector interface permits later CV models. This avoids unapproved scraping and fabricated player statistics.
+Supermajor enrichment is optional. Set `SAS_SUPERMAJOR_ENABLED=true`, then enter a verified Supermajor player ID such as `S222927` in the dashboard. The provider reads the public [player overview page](https://www.supermajor.gg/ultimate/player/_?id=S222927) on demand. It parses the page's embedded structured data; this is an undocumented page format, not an official API. A changed format, invalid ID, missing page, or network failure yields no evidence. Start.gg IDs are **not** assumed to be Supermajor IDs. The dashboard shows lookup status, canonical name, reported character distribution, and errors. The manual Refresh button bypasses the seven day SQLite cache. Requests have a timeout and at most two run concurrently.
+
+Character probabilities are calculated only from reported `num_games` counts. The last six months are used when they contain at least `SAS_SUPERMAJOR_MIN_GAMES` (default 20) reported games; otherwise all time is used if sufficient. If neither is sufficient, the distribution is empty. Supermajor [describes its character data and limitations](https://www.supermajor.gg/articles/dev-build-update-2024-08-28); unreported games and fallback main labels are excluded here. A saved local override wins over public data. If an ID comes from anything other than explicit operator entry and the page name differs, the provider marks it ambiguous. Public page access was verified on 2026-10-02; live service behavior may change.
 
 ## Calibration
 
-The dashboard calibration card displays the latest frame. Create named profiles, drag rectangles for tag, HUD, character, gameplay, game set, result, and winner regions, and save. Coordinates are normalized and stored at `SAS_CALIBRATION_PATH`. Tesseract OCR must be installed separately and available on `PATH` for text detection. Test crops against actual footage, overlays, transition screens, and different stages before arming automation. The current generic gameplay detector uses image variance and is experimental; winner association requires explicit slot text in its own region. The character detector is an interface only and currently returns unknown.
+The dashboard calibration card displays the latest frame. Create named profiles, drag rectangles for tag, HUD, character, gameplay, game set, result, and winner regions, and save. Coordinates are normalized and stored at `SAS_CALIBRATION_PATH`. Tesseract OCR must be installed separately and available on `PATH` for text detection. Test crops against actual footage, overlays, transition screens, and different stages before arming automation. The current generic gameplay detector uses image variance and is experimental; winner association requires explicit slot text in its own region.
+
+For characters, draw tight `p1_character` and `p2_character` rectangles around the HUD portraits, excluding damage numbers and stage background where possible. With a gameplay frame visible, use **Character templates** to save a named crop for that slot. Capture a few examples per character under different stages or visual effects. Templates are local PNGs in `SAS_CHARACTER_TEMPLATE_PATH` (default `config/character_templates`) and are ignored by Git. Recognition compares normalized gray portraits with local templates, requires an absolute match and a margin over the next character, and needs three agreeing observations in a five-sample window. Unknown, missing, or ambiguous crops yield no character. History clears on game generation changes. Detection runs independently of OCR at `SAS_CHARACTER_INTERVAL` (default 0.5 seconds). Character history alone is capped at 90% mapping confidence, below the 95% default mapping gate.
+
+To replay a recording, run:
+
+```powershell
+python -m smash_auto_score.analyze_video 'C:\path\to\recording.mp4' --start 779 --end 1250 --step 5 --output diagnostics/characters.csv
+```
+
+The CSV lists the stable detected character or `unknown` per slot and sample. Inspect transitions and any wrong labels, then adjust regions/templates before using the observations. On the supplied 1920×1080 recording, local templates captured at 13:20 and 16:00 were replayed at 10-second intervals from 13:20 to 20:00. Before the character switch, the detector labeled Donkey Kong in 6/11 P1 samples and Little Mac in 8/11 P2 samples. After the switch, it labeled Donkey Kong in 21/25 P1 samples and Joker in 17/25 P2 samples. The remaining samples were `unknown`; all ten portrait observations from 15:10 to 15:50 were unknown during the transition. There were no wrong labels among these 72 pre/post portrait samples. This is one broadcast layout with three character templates, not validation across the full roster or other layouts.
 
 ## Tests and development
 
@@ -71,7 +83,7 @@ python -m ruff check src tests
 python -m mypy src/smash_auto_score --ignore-missing-imports
 ```
 
-SQLite stores score transactions and event logs. Demo tests cover one tag, random tags, color tolerance, character discrimination, conflicting signals, idempotency, undo, and set completion. External integrations need rehearsal footage and live service verification. Avoid relying on the generic detector for real tournament scoring before collecting labeled frame sequences and measuring false positives.
+SQLite stores score transactions and event logs. Demo tests cover one tag, random tags, color tolerance, character discrimination, conflicting signals, idempotency, undo, and set completion. Provider tests cover parsing, caching, ID handling, and failure behavior with a mock HTTP transport. Detector tests cover consensus, switching, reset, and no-template behavior. External integrations need rehearsal footage and live service verification. Avoid relying on the generic winner detector for real tournament scoring before collecting labeled frame sequences and measuring false positives.
 
 ## Roadmap
 

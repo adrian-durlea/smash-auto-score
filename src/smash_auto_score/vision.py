@@ -1,6 +1,7 @@
 """Calibrated, deliberately conservative frame observations."""
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Protocol
 
 import cv2
@@ -47,11 +48,19 @@ class TesseractOCR:
 
 class CharacterDetector(Protocol):
     def detect(self, image: np.ndarray, slot: Slot) -> tuple[str | None, float]: ...
+    def reset(self) -> None: ...
+    def save(self, crop: np.ndarray, slot: Slot, character: str) -> Path: ...
 
 
 class NoCharacterDetector:
     def detect(self, image: np.ndarray, slot: Slot) -> tuple[str | None, float]:
         return None, 0.0
+
+    def reset(self) -> None:
+        pass
+
+    def save(self, crop: np.ndarray, slot: Slot, character: str) -> Path:
+        raise ValueError("Character templates are not configured")
 
 
 class WinnerDetector:
@@ -92,7 +101,8 @@ class FrameDetector:
         self.ocr = ocr or TesseractOCR()
         self.characters = characters or NoCharacterDetector()
 
-    def observe(self, frame: np.ndarray, *, do_ocr: bool = True, do_color: bool = True) -> Observation:
+    def observe(self, frame: np.ndarray, *, do_ocr: bool = True, do_color: bool = True,
+                do_character: bool = True) -> Observation:
         obs = Observation()
         for slot in Slot:
             tag_roi = self.calibration.rois.get(f"{slot.value.lower()}_tag")
@@ -106,9 +116,9 @@ class FrameDetector:
                 if color:
                     obs.colors[slot] = color
             character_roi = self.calibration.rois.get(f"{slot.value.lower()}_character")
-            if do_ocr and character_roi:
+            if do_character and character_roi:
                 character, confidence = self.characters.detect(character_roi.crop(frame), slot)
-                if character and confidence >= .8:
+                if character and confidence >= .72:
                     obs.characters[slot] = character
         active_roi = self.calibration.rois.get("gameplay")
         if active_roi:

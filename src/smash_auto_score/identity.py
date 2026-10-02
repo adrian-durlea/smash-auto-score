@@ -79,9 +79,13 @@ def mapping_evidence(match: SetInfo, obs: Observation, previous: bool | None = N
                     evidence.append(Evidence("color", direct if color_fit > other_fit else not direct,
                                              min(0.99, 0.7 + abs(color_fit - other_fit) * 0.29),
                                              f"{slot.value} HUD color {color} discriminates player colors", 1.3))
+    if len(set(obs.characters.values())) == 1 and len(obs.characters) == 2:
+        characters = {}
+    else:
+        characters = obs.characters
     for slot, char_player, char_other, direct in ((Slot.P1, match.left, match.right, True),
                                                   (Slot.P2, match.right, match.left, True)):
-        character = obs.characters.get(slot)
+        character = characters.get(slot)
         if character:
             char_fit = _character_probability(char_player, character)
             other_char_fit = _character_probability(char_other, character)
@@ -110,7 +114,7 @@ def fuse(evidence: list[Evidence]) -> MappingDecision:
     confidence = 1 / (1 + math.exp(-abs(log_odds)))
     if conflict:
         confidence = min(confidence, 0.85)
-    if len(evidence) == 1 and evidence[0].source == "character_history":
+    if all(item.source == "character_history" for item in evidence):
         confidence = min(confidence, 0.90)
     return MappingDecision(log_odds > 0, confidence, evidence, conflict)
 

@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     startgg_token: str = ""
     startgg_tournament_slug: str = ""
     startgg_stream_name: str = ""
+    supermajor_enabled: bool = False
+    supermajor_cache_ttl_days: int = 7
+    supermajor_timeout_seconds: float = 10.0
+    supermajor_min_games: int = 20
     min_mapping_confidence: float = 0.95
     min_winner_confidence: float = 0.97
     min_set_confidence: float = 0.97
@@ -26,3 +30,5 @@ class Settings(BaseSettings):
     frame_fps: float = 5.0
     ocr_interval: float = 1.0
     color_interval: float = 0.5
+    character_template_path: str = "config/character_templates"
+    character_interval: float = 0.5

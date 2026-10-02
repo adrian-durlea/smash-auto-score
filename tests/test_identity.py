@@ -46,3 +46,10 @@ def test_conflict_lowers_confidence():
 def test_color_tolerance():
     assert color_similarity("#e33840", "#ef3636") > .8
     assert color_similarity("#e33840", "#307af0") < .2
+
+
+def test_character_only_cannot_reach_automatic_mapping_threshold():
+    decision = map_players(match(), Observation(characters={Slot.P1: "terry", Slot.P2: "fox"}))
+    assert decision.confidence <= .90
+    shared = map_players(match(), Observation(characters={Slot.P1: "terry", Slot.P2: "terry"}))
+    assert shared.p1_is_left is None

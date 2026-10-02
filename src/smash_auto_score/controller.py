@@ -10,6 +10,7 @@ from .integrations import TSHAdapter
 from .player_data import LocalPlayerDataProvider
 from .state import GamePhase, GameStateMachine
 from .store import Store
+from .supermajor import SupermajorPlayerDataProvider
 
 log = logging.getLogger(__name__)
 
@@ -30,12 +31,21 @@ class Controller:
         self.error: str | None = None
         self.lock = asyncio.Lock()
         self.player_data = LocalPlayerDataProvider(store)
+        self.supermajor = SupermajorPlayerDataProvider(
+            store, enabled=settings.supermajor_enabled,
+            cache_ttl_days=settings.supermajor_cache_ttl_days,
+            timeout_seconds=settings.supermajor_timeout_seconds,
+            min_games=settings.supermajor_min_games)
         self.set_complete_at: float | None = None
         self.next_dismissed = False
         self.auto_swapped_set_id: str | None = None
 
     async def refresh(self) -> SetInfo:
         match = await self.tsh.get_current_set()
+        await self.player_data.enrich(match.left)
+        await self.player_data.enrich(match.right)
+        await self.supermajor.enrich(match.left)
+        await self.supermajor.enrich(match.right)
         await self.player_data.enrich(match.left)
         await self.player_data.enrich(match.right)
         if self.match and match.set_id != self.match.set_id:
@@ -68,7 +78,9 @@ class Controller:
                 "swap_suggested": self.mapping.p1_is_left is False and
                  self.mapping.confidence >= self.settings.min_mapping_confidence and not self.mapping.conflict,
                 "mapping": asdict(self.mapping), "observation": asdict(self.observation),
-                "next_candidate": self.next_candidate, "events": self.store.recent()}
+                "next_candidate": self.next_candidate, "events": self.store.recent(),
+                "supermajor": {"left": self.supermajor.status(self.match.left),
+                               "right": self.supermajor.status(self.match.right)} if self.match else {}}
 
     async def ingest(self, obs: Observation) -> None:
         async with self.lock:
@@ -180,6 +192,10 @@ class Controller:
             observation = Observation()
         ranked = []
         for match in candidates:
+            await self.player_data.enrich(match.left)
+            await self.player_data.enrich(match.right)
+            await self.supermajor.enrich(match.left)
+            await self.supermajor.enrich(match.right)
             await self.player_data.enrich(match.left)
             await self.player_data.enrich(match.right)
             scores: list[tuple[float, list[str]]] = []

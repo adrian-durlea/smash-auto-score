@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -182,6 +183,7 @@ class PlayerOverrideRequest(BaseModel):
     side: Side
     aliases: list[str] = []
     character_distribution: dict[str, float] = {}
+    supermajor_id: str | None = None
 
 
 @app.post("/api/player-override")
@@ -192,8 +194,63 @@ async def player_override(body: PlayerOverrideRequest):
         raise HTTPException(400, "Character probabilities must be between 0 and 1")
     player.aliases = body.aliases
     player.character_distribution = {key.casefold(): value for key, value in body.character_distribution.items()}
+    if body.supermajor_id is not None:
+        proposed = body.supermajor_id.strip().upper()
+        if proposed and not re.fullmatch(r"S?[0-9]+", proposed):
+            raise HTTPException(400, "Supermajor ID must be S followed by digits")
+        player.supermajor_id = proposed or None
     controller.player_data.save(player)
     return {"ok": True}
+
+
+@app.post("/api/supermajor/refresh/{side}")
+async def refresh_supermajor(side: Side):
+    match = await _do(controller.refresh())
+    player = match.left if side == Side.LEFT else match.right
+    result = await controller.supermajor.lookup(player, force=True)
+    return result
+
+
+class SupermajorIdRequest(BaseModel):
+    side: Side
+    supermajor_id: str
+
+
+@app.post("/api/supermajor/id")
+async def attach_supermajor_id(body: SupermajorIdRequest):
+    proposed = body.supermajor_id.strip().upper()
+    if proposed and not re.fullmatch(r"S?[0-9]+", proposed):
+        raise HTTPException(400, "Supermajor ID must be S followed by digits")
+    match = await _do(controller.refresh())
+    player = match.left if body.side == Side.LEFT else match.right
+    local = controller.store.cache_get(controller.player_data.key(player)) or {}
+    player.aliases = local.get("aliases", [])
+    player.character_distribution = local.get("character_distribution", {})
+    player.supermajor_id = proposed or None
+    controller.player_data.save(player)
+    return {"ok": True, "supermajor_id": player.supermajor_id}
+
+
+class CharacterTemplateRequest(BaseModel):
+    slot: Slot
+    character: str
+
+
+@app.post("/api/characters/template")
+async def save_character_template(body: CharacterTemplateRequest):
+    if not video_worker or not video_worker.latest_frame:
+        raise HTTPException(404, "No video frame available")
+    roi = video_worker.detector.calibration.rois.get(f"{body.slot.value.lower()}_character")
+    if not roi:
+        raise HTTPException(400, "Calibrate the character region first")
+    image = cv2.imdecode(np.frombuffer(video_worker.latest_frame, np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise HTTPException(503, "Cannot decode current frame")
+    try:
+        path = video_worker.detector.characters.save(roi.crop(image), body.slot, body.character)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"saved": path.name, "slot": body.slot.value}
 
 
 class CalibrationRequest(BaseModel):

@@ -6,7 +6,9 @@ from pathlib import Path
 
 import cv2
 
+from .characters import TemplateCharacterDetector
 from .controller import Controller
+from .domain import Slot
 from .integrations import VideoSource
 from .vision import ROI, Calibration, FrameDetector
 
@@ -56,15 +58,21 @@ class VideoWorker:
                  fps: float = 5, ocr_interval: float = 1, color_interval: float = .5):
         self.source, self.controller, self.calibration_path = source, controller, calibration_path
         self.fps, self.ocr_interval, self.color_interval = fps, ocr_interval, color_interval
-        self.detector = FrameDetector(load_calibration(calibration_path))
+        self.detector = FrameDetector(load_calibration(calibration_path), characters=
+                                      TemplateCharacterDetector(Path(controller.settings.character_template_path)))
         self.latest_frame: bytes | None = None
         self.connected = False
         self.error: str | None = None
         self._last_ocr = 0.0
         self._last_color = 0.0
+        self._last_character = 0.0
+        self._generation = controller.machine.generation
+        self._last_characters: dict[Slot, str] = {}
 
     def reload_calibration(self) -> None:
         self.detector.calibration = load_calibration(self.calibration_path)
+        self.detector.characters.reset()
+        self._last_characters.clear()
 
     async def run(self) -> None:
         while True:
@@ -77,10 +85,20 @@ class VideoWorker:
                 if ok:
                     self.latest_frame = encoded.tobytes()
                 now = time.monotonic()
+                if self._generation != self.controller.machine.generation:
+                    self.detector.characters.reset()
+                    self._last_characters.clear()
+                    self._generation = self.controller.machine.generation
                 do_ocr = now - self._last_ocr >= self.ocr_interval
                 do_color = now - self._last_color >= self.color_interval
+                do_character = now - self._last_character >= self.controller.settings.character_interval
                 obs = await asyncio.to_thread(self.detector.observe, frame,
-                                              do_ocr=do_ocr, do_color=do_color)
+                                              do_ocr=do_ocr, do_color=do_color,
+                                              do_character=do_character)
+                if do_character:
+                    self._last_characters = obs.characters.copy()
+                else:
+                    obs.characters = self._last_characters.copy()
                 if not do_ocr:
                     obs.game_set = None
                     obs.result_screen = None
@@ -89,6 +107,8 @@ class VideoWorker:
                     self._last_ocr = now
                 if do_color:
                     self._last_color = now
+                if do_character:
+                    self._last_character = now
                 await self.controller.ingest(obs)
             except EOFError:
                 self.connected = False
