@@ -96,7 +96,11 @@ async def test_persistent_results_score_once_and_manual_correction(tmp_path):
     for _ in range(20):
         await controller.ingest(result)
     assert (await controller.refresh()).left_score == 1
-    assert len([e for e in controller.store.recent() if e["kind"] == "score_applied"]) == 1
+    applied = [e for e in controller.store.recent() if e["kind"] == "score_applied"]
+    assert len(applied) == 1
+    audit = json.loads(applied[0]["detail"])
+    assert audit["before"] == [0, 0]
+    assert audit["after"] == [1, 0]
     await controller.manual_score(Side.RIGHT)
     assert len([e for e in controller.store.recent() if e["kind"] == "winner_prediction_error"]) == 1
 

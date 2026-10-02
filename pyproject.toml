@@ -28,3 +28,7 @@ target-version = "py312"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[[tool.mypy.overrides]]
+module = ["pytesseract", "obsws_python"]
+ignore_missing_imports = true

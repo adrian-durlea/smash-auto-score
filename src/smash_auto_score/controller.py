@@ -174,11 +174,12 @@ class Controller:
             raise ValueError("No valid two-player set loaded in TSH")
         if match.complete:
             raise ValueError("Set is complete")
+        before_left, before_right = match.left_score, match.right_score
         if not self.store.start_score(event_id, match.set_id, side.value,
-                                      match.left_score, match.right_score):
+                                      before_left, before_right):
             return False
-        new_left = match.left_score + (side == Side.LEFT)
-        new_right = match.right_score + (side == Side.RIGHT)
+        new_left = before_left + (side == Side.LEFT)
+        new_right = before_right + (side == Side.RIGHT)
         try:
             await self.tsh.set_score(int(new_left), int(new_right))
             verified = await self.tsh.get_current_set()
@@ -196,7 +197,7 @@ class Controller:
         if verified.complete:
             self.set_complete_at = time.time()
         self.store.log("score_applied", {"event_id": event_id, "side": side.value,
-                       "before": [match.left_score, match.right_score],
+                       "before": [before_left, before_right],
                        "after": [verified.left_score, verified.right_score],
                        "automatic": automatic, "mapping": asdict(self.mapping)})
         return True

@@ -24,6 +24,16 @@ Enable OBS WebSocket 5.x and configure `SAS_OBS_HOST`, `SAS_OBS_PORT`, `SAS_OBS_
 
 ## Set rehearsal
 
+For a recording, use the disposable in-memory scoreboard rehearsal before a live TSH test:
+
+```powershell
+python -m smash_auto_score.rehearse_video "C:\path\to\recording.mp4" --window 14:50-15:15 --window 20:30-20:55 --p1-is-left --step 0.2 --output diagnostics/rehearsal.json
+```
+
+Each `--window` uses recording timestamps and can be repeated for consecutive games. Specify the verified P1 mapping with `--p1-is-left` or `--p1-is-right` to arm the disposable scoreboard. Without it, the replay can observe but will not assume a mapping. It never contacts the configured live TSH service. Inspect the JSON for one `game_end` and one `score_applied` per scored game, sequential `before`/`after` scores, and distinct event IDs. The demo scoreboard starts at 0–0 and completes at three wins; replay later games in a fresh invocation if necessary.
+
+On the supplied 3h41m recording, the 14:50–15:15 and 20:30–20:55 windows produced two distinct end and score events, 0–0 to 1–0 to 2–0. A separate 44:30–45:05 window produced one end and one right-side score event, 0–0 to 0–1. No duplicate score event appeared within those windows. These runs used local calibration and 0.2-second samples with the verified P1-left mapping; they do not establish accuracy on a different broadcast layout.
+
 1. Load two players in TSH and verify names, scores, best-of, and player colors in the dashboard.
 2. Enter verified Supermajor IDs only if desired; confirm the page name and usage data or an explicit unavailable status.
 3. Show gameplay in OBS. Calibrate `p1_character`, `p2_character`, `placement`, `winner_badge`, and `loser_badge` for the exact output layout. Capture local character templates, then check that both HUD slots become stable.
