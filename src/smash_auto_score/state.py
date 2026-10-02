@@ -47,8 +47,7 @@ class GameStateMachine:
         result = obs.result_screen is True and obs.result_confidence >= .97
         if obs.result_screen is True and obs.game_set is True:
             result = True  # Existing OCR/replay observations.
-        active = (obs.game_active and obs.game_set is not True and not obs.result_screen
-                  and (obs.hud_visible or obs.timestamp == 0))
+        active = (obs.game_active and obs.game_set is not True and not obs.result_screen)
         if self.phase in (GamePhase.WAITING, GamePhase.STARTING, GamePhase.POST_GAME,
                           GamePhase.UPDATED):
             lockout = bool(self.ended_at and obs.timestamp and

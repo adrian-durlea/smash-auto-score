@@ -44,6 +44,11 @@ class Controller:
         self.next_dismissed = False
         self.auto_swapped_set_id: str | None = None
         self.handled_end_events: set[str] = set()
+        self.shadow_mode = False
+        self.shadow_started_at: float | None = None
+        self.score_snapshot: tuple[str, int, int] | None = None
+        self.external_score_change: dict | None = None
+        self.tsh_was_disconnected = False
         self.last_tsh_ms = 0.0
         self.last_state_ms = 0.0
 
@@ -51,6 +56,18 @@ class Controller:
         started = time.perf_counter()
         match = await self.tsh.get_current_set()
         self.last_tsh_ms = (time.perf_counter() - started) * 1000
+        if self.tsh_was_disconnected:
+            self.tsh_was_disconnected = False
+            self.store.log("tsh_reconnected", {"set_id": match.set_id})
+        observed_score = (match.set_id, match.left_score, match.right_score)
+        if (self.score_snapshot and observed_score[0] == self.score_snapshot[0]
+                and observed_score != self.score_snapshot and not self.external_score_change):
+            self.external_score_change = {"expected": list(self.score_snapshot[1:]),
+                                          "observed": [match.left_score, match.right_score],
+                                          "set_id": match.set_id}
+            self.armed = False
+            self.store.log("external_score_change", self.external_score_change)
+        self.score_snapshot = observed_score
         await self.player_data.enrich(match.left)
         await self.player_data.enrich(match.right)
         await self.supermajor.enrich(match.left)
@@ -65,6 +82,7 @@ class Controller:
             self.next_dismissed = False
             self.auto_swapped_set_id = None
             self.handled_end_events.clear()
+            self.external_score_change = None
             self.store.log("set_changed", {"set_id": match.set_id})
         if match.complete and self.set_complete_at is None:
             self.set_complete_at = time.time()
@@ -80,6 +98,9 @@ class Controller:
         except Exception as exc:  # noqa: BLE001 - status must survive adapter failures
             self.error = str(exc)
             self.armed = False
+            if not self.tsh_was_disconnected:
+                self.store.log("tsh_disconnected", {"error": str(exc)[:160]})
+            self.tsh_was_disconnected = True
             log.warning("TSH read failed: %s", exc)
         ready = (self.armed and self.error is None and self.machine.phase == GamePhase.RESULT
                  and self.machine.end_detection.confidence >=
@@ -101,7 +122,9 @@ class Controller:
                            "evidence": self.machine.winner_evidence,
                            "mapped_competitor": mapped_competitor},
                 "auto_score_ready": ready,
-                "armed": self.armed, "set_mode": self.set_mode.value,
+                "armed": self.armed, "shadow_mode": self.shadow_mode,
+                "external_score_change": self.external_score_change,
+                "set_mode": self.set_mode.value,
                 "swap_mode": self.swap_mode.value,
                 "swap_suggested": self.mapping.p1_is_left is False and
                  self.mapping.confidence >= self.settings.min_mapping_confidence and not self.mapping.conflict,
@@ -116,6 +139,9 @@ class Controller:
                 match = await self.refresh()
             except Exception:
                 self.armed = False
+                if not self.tsh_was_disconnected:
+                    self.store.log("tsh_disconnected", {})
+                self.tsh_was_disconnected = True
                 raise
             self.observation = obs
             self.mapping = map_players(match, obs, self.previous_mapping)
@@ -123,7 +149,7 @@ class Controller:
                 self.mapping = MappingDecision(self.manual_mapping, 1.0, self.mapping.evidence)
             independent = {e.source for e in self.mapping.evidence
                            if not e.p1_is_left and e.confidence >= .9 and e.source != "previous_mapping"}
-            if (self.swap_mode == Mode.AUTO and self.mapping.p1_is_left is False
+            if (not self.shadow_mode and self.swap_mode == Mode.AUTO and self.mapping.p1_is_left is False
                     and self.mapping.confidence >= .99 and not self.mapping.conflict
                     and len(independent) >= 2 and self.manual_mapping is None
                     and match.left_score == match.right_score == 0
@@ -139,7 +165,14 @@ class Controller:
                 self.mapping = MappingDecision(True, self.mapping.confidence, self.mapping.evidence)
                 self.store.log("auto_players_swapped", {"set_id": match.set_id})
             state_started = time.perf_counter()
+            prior_generation = self.machine.generation
             confirmed_end = self.machine.observe(obs)
+            if self.machine.generation != prior_generation:
+                self.machine.generation = self.store.next_game_generation(match.set_id)
+                self.previous_mapping = None if self.manual_mapping is None else self.manual_mapping
+                self.mapping = map_players(match, obs, self.previous_mapping)
+                if self.manual_mapping is not None:
+                    self.mapping = MappingDecision(self.manual_mapping, 1.0, self.mapping.evidence)
             self.last_state_ms = (time.perf_counter() - state_started) * 1000
             if self.mapping.p1_is_left is not None and self.mapping.confidence >= self.settings.min_mapping_confidence:
                 self.previous_mapping = self.mapping.p1_is_left
@@ -149,7 +182,8 @@ class Controller:
                                "evidence": asdict(self.machine.end_detection)})
             if self.machine.end_detection.ended:
                 event_id = f"{match.set_id}:{self.machine.generation}"
-                if (event_id not in self.handled_end_events and self.armed
+                if (event_id not in self.handled_end_events and (self.armed or self.shadow_mode)
+                        and self.external_score_change is None
                         and self.machine.end_detection.confidence >=
                         self.settings.game_end_confidence_threshold
                         and self.machine.winner is not None
@@ -160,7 +194,14 @@ class Controller:
                     side = Side.LEFT if ((self.machine.winner == Slot.P1) ==
                                          self.mapping.p1_is_left) else Side.RIGHT
                     self.handled_end_events.add(event_id)
-                    await self._score(event_id, side, automatic=True)
+                    if self.shadow_mode:
+                        self.store.log("would_score", {"event_id": event_id, "side": side.value,
+                                       "winner": self.machine.winner.value,
+                                       "competitor": (match.left if side == Side.LEFT else match.right).display_name,
+                                       "mapping_confidence": self.mapping.confidence})
+                        self.machine.phase = GamePhase.UPDATED
+                    else:
+                        await self._score(event_id, side, automatic=True)
                 elif (event_id not in self.handled_end_events and
                       (not self.armed or self.machine.phase == GamePhase.POST_GAME)):
                     self.handled_end_events.add(event_id)
@@ -169,6 +210,10 @@ class Controller:
                                    "mapping_confidence": self.mapping.confidence})
 
     async def _score(self, event_id: str, side: Side, automatic: bool) -> bool:
+        if self.shadow_mode:
+            raise ValueError("Shadow mode blocks TSH score writes")
+        if self.external_score_change:
+            raise ValueError("Review external TSH score change before scoring")
         match = await self.refresh()
         if match.set_id in ("", "0", "None") or match.left.display_name == "?" or match.right.display_name == "?":
             raise ValueError("No valid two-player set loaded in TSH")
@@ -192,6 +237,7 @@ class Controller:
             self.store.log("score_uncertain", {"event_id": event_id, "error": str(exc)})
             raise
         self.store.finish_score(event_id, "applied")
+        self.score_snapshot = (verified.set_id, verified.left_score, verified.right_score)
         self.match = verified
         self.machine.phase = GamePhase.SET_COMPLETE if verified.complete else GamePhase.UPDATED
         if verified.complete:
@@ -234,6 +280,7 @@ class Controller:
             if (check.left_score, check.right_score) != (last["before_left"], last["before_right"]):
                 raise RuntimeError("Undo read back failed")
             self.store.finish_score(last["event_id"], "undone")
+            self.score_snapshot = (check.set_id, check.left_score, check.right_score)
             self.machine.phase = GamePhase.POST_GAME
             self.store.log("score_undone", {"event_id": last["event_id"]})
             return True
@@ -242,6 +289,49 @@ class Controller:
         self.manual_mapping = self.previous_mapping = p1_is_left
         self.mapping = MappingDecision(p1_is_left, 1.0, [])
         self.store.log("mapping_override", {"p1_is_left": p1_is_left})
+
+    def accept_external_score(self) -> None:
+        if not self.external_score_change:
+            raise ValueError("No external score change to accept")
+        self.store.log("external_score_accepted", self.external_score_change)
+        self.external_score_change = None
+
+    async def reconcile_uncertain_score(self) -> dict:
+        async with self.lock:
+            event = self.store.last_uncertain_score()
+            if not event:
+                raise ValueError("No uncertain score write to reconcile")
+            current = await self.tsh.get_current_set()
+            before = (event["before_left"], event["before_right"])
+            expected = (before[0] + (event["side"] == "left"),
+                        before[1] + (event["side"] == "right"))
+            observed = (current.left_score, current.right_score)
+            if current.set_id != event["set_id"]:
+                outcome = "REVIEW_SET_CHANGED"
+            elif observed == expected:
+                outcome = "APPLIED"
+                self.store.finish_score(event["event_id"], "applied")
+            elif observed == before:
+                outcome = "NOT_APPLIED"
+                self.store.finish_score(event["event_id"], "not_applied")
+            else:
+                outcome = "REVIEW_SCORE_DIFFERENT"
+            self.armed = False
+            self.score_snapshot = (current.set_id, *observed)
+            if outcome in {"APPLIED", "NOT_APPLIED"}:
+                self.external_score_change = None
+            result = {"outcome": outcome, "event_id": event["event_id"],
+                      "before": list(before), "expected": list(expected),
+                      "observed": list(observed), "set_id": current.set_id}
+            self.store.log("score_reconciled", result)
+            return result
+
+    def set_shadow_mode(self, enabled: bool) -> None:
+        self.shadow_mode = enabled
+        self.armed = False
+        if enabled:
+            self.shadow_started_at = time.time()
+        self.store.log("shadow_mode", {"enabled": enabled})
 
     async def suggest_next_set(self, assigned: set[str] | None = None) -> dict | None:
         candidates = await self.tsh.get_possible_sets()
@@ -293,7 +383,7 @@ class Controller:
                                top[1].right.display_name], "confidence": top[0],
                                "second_best": second, "reasons": top[2]}
         self.store.log("set_candidate", self.next_candidate)
-        if (self.set_mode == Mode.AUTO and top[0] >= self.settings.min_set_confidence
+        if (not self.shadow_mode and self.set_mode == Mode.AUTO and top[0] >= self.settings.min_set_confidence
                 and top[0] - second >= self.settings.min_set_margin
                 and (self.set_complete_at is None or
                      (time.time() - self.set_complete_at >= self.settings.post_set_delay_seconds
@@ -304,6 +394,8 @@ class Controller:
         return self.next_candidate
 
     async def load_next_set(self) -> None:
+        if self.shadow_mode:
+            raise ValueError("Shadow mode blocks TSH set loading")
         if not self.next_candidate:
             raise ValueError("No next-set candidate")
         set_id = self.next_candidate["set_id"]

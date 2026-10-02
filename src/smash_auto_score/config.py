@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     obs_source: str = ""
     recorded_video: str = ""
     calibration_path: str = "config/calibration.json"
-    tsh_url: str = "http://127.0.0.1:5000"
+    tsh_url: str = "http://127.0.0.1:5500"
     tsh_scoreboard: int = 1
     startgg_token: str = ""
     startgg_tournament_slug: str = ""

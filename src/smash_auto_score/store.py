@@ -12,7 +12,20 @@ class Store:
         self.db.execute("CREATE TABLE IF NOT EXISTS score_events (event_id TEXT PRIMARY KEY, set_id TEXT, side TEXT, before_left INTEGER, before_right INTEGER, status TEXT, created REAL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS event_log (id INTEGER PRIMARY KEY, created REAL, kind TEXT, detail TEXT)")
         self.db.execute("CREATE TABLE IF NOT EXISTS profiles (key TEXT PRIMARY KEY, value TEXT, expires REAL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS game_sequence (set_id TEXT PRIMARY KEY, generation INTEGER NOT NULL)")
         self.db.commit()
+
+    def next_game_generation(self, set_id: str) -> int:
+        existing = self.db.execute("SELECT event_id FROM score_events WHERE set_id=?", (set_id,))
+        prefix = f"{set_id}:"
+        highest = max((int(row[0][len(prefix):]) for row in existing
+                       if row[0].startswith(prefix) and row[0][len(prefix):].isdecimal()), default=0)
+        self.db.execute("INSERT INTO game_sequence(set_id,generation) VALUES(?,?) ON CONFLICT(set_id) DO NOTHING",
+                        (set_id, highest))
+        self.db.execute("UPDATE game_sequence SET generation=generation+1 WHERE set_id=?", (set_id,))
+        self.db.commit()
+        row = self.db.execute("SELECT generation FROM game_sequence WHERE set_id=?", (set_id,)).fetchone()
+        return int(row[0])
 
     def log(self, kind: str, detail: dict) -> None:
         self.db.execute("INSERT INTO event_log(created,kind,detail) VALUES(?,?,?)",
@@ -42,6 +55,10 @@ class Store:
 
     def last_score(self) -> dict | None:
         row = self.db.execute("SELECT * FROM score_events WHERE status='applied' ORDER BY created DESC LIMIT 1").fetchone()
+        return dict(row) if row else None
+
+    def last_uncertain_score(self) -> dict | None:
+        row = self.db.execute("SELECT * FROM score_events WHERE status='uncertain' ORDER BY created DESC LIMIT 1").fetchone()
         return dict(row) if row else None
 
     def cache_get(self, key: str) -> dict | None:

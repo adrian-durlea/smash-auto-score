@@ -4,6 +4,18 @@ A local broadcast controller for Super Smash Bros. Ultimate tournaments. It help
 
 For a complete feature inventory, validation status, and prioritized remaining work, see the [project status write-up](docs/project-status.md).
 
+## Quick setup
+
+1. Open Tournament Stream Helper (TSH) and load a disposable two-player set for testing.
+2. Open OBS and enable **Tools → WebSocket Server Settings → Enable WebSocket server** if needed.
+3. Start AutoScore with `python -m uvicorn smash_auto_score.app:app --host 127.0.0.1 --port 8765`.
+4. Open `http://127.0.0.1:8765/setup`. Discover local services, choose the correct TSH and OBS source, review its frame, and run full read-only validation.
+5. Start **shadow rehearsal**. Compare its would-be scores with a real set before arming automatic scoring in the dashboard.
+
+The wizard discovers local TSH ports (including 5500 used by the installed copy), OBS WebSocket ports, scenes, and capture inputs. It saves selected settings in ignored `.env` and applies them to the running app. The operator may still need to provide the OBS WebSocket password, a [Start.gg personal API token](https://developer.start.gg/docs/authentication/) from account Developer Settings, a tournament URL if TSH has none, and a choice among ambiguous sources or streams. Start.gg is optional. The setup page never runs a TSH write during discovery or full validation. Its separate disposable score test explicitly changes one point, reads it back, restores it, and verifies restoration; run it only on a disposable set. The local check command is `python -m smash_auto_score.integration_check`.
+
+If TSH reports `./user_data/settings.json` missing while the file exists beside `TSH.exe`, launch the EXE with its extracted folder as the working directory. The current machine's TSH web server was reachable on `127.0.0.1:5500`, but it had no loaded two-player set during this setup work. OBS was not running and no Start.gg token was configured, so the current machine is **not ready for rehearsal** yet. See [setup validation details](docs/setup.md).
+
 ## Safety model
 
 Auto score starts **disarmed**. Next set mode starts at **SUGGEST**. An automatic point requires a confirmed game end, a slot winner above the winner threshold, and a two hypothesis player mapping above the mapping threshold. Conflicting evidence caps mapping confidence. If a TSH write cannot be verified, automation disarms and the transaction is marked uncertain for operator review. A game generation and persisted event ID prevent duplicate points while an end screen remains visible. Undo checks the current set and expected score before reversing a transaction.

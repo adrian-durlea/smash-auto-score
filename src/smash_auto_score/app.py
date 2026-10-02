@@ -2,6 +2,7 @@ import asyncio
 import logging
 import re
 import time
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -20,6 +21,16 @@ from .integrations import (
     RecordedVideoSource,
     StartGGProvider,
     TSHWebAdapter,
+    VideoSource,
+)
+from .setup_wizard import (
+    discover_obs,
+    discover_tsh,
+    probe_startgg,
+    readiness,
+    save_local_settings,
+    test_obs_frame,
+    tournament_slug,
 )
 from .store import Store
 from .telemetry import ProcessSampler
@@ -37,6 +48,9 @@ settings = Settings()
 controller = Controller(DemoTSHAdapter() if settings.demo else TSHWebAdapter(settings.tsh_url, settings.tsh_scoreboard),
                         Store(settings.database_path), settings)
 video_worker: VideoWorker | None = None
+video_task: asyncio.Task | None = None
+setup_preview: bytes | None = None
+setup_frame_result: dict | None = None
 process_sampler = ProcessSampler()
 if settings.recorded_video:
     video_worker = VideoWorker(RecordedVideoSource(settings.recorded_video), controller,
@@ -52,11 +66,12 @@ elif settings.obs_source:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    global video_task
     try:
         await controller.refresh()
     except Exception as exc:  # noqa: BLE001 - external service may fail in many ways
         logging.getLogger(__name__).warning("Initial TSH read failed: %s", exc)
-    task = asyncio.create_task(video_worker.run()) if video_worker else None
+    video_task = asyncio.create_task(video_worker.run()) if video_worker else None
     next_task = asyncio.create_task(next_set_loop())
     yield
     next_task.cancel()
@@ -64,15 +79,272 @@ async def lifespan(_app: FastAPI):
         await next_task
     except asyncio.CancelledError:
         pass
-    if task:
-        task.cancel()
+    if video_task:
+        video_task.cancel()
         try:
-            await task
+            await video_task
         except asyncio.CancelledError:
             pass
 
 
 app = FastAPI(title="Smash AutoScore", lifespan=lifespan)
+
+
+async def _reconfigure_video() -> None:
+    global video_worker, video_task
+    if video_task:
+        video_task.cancel()
+        try:
+            await video_task
+        except asyncio.CancelledError:
+            pass
+        video_task = None
+    if settings.recorded_video:
+        source: VideoSource = RecordedVideoSource(settings.recorded_video)
+    elif settings.obs_source:
+        source = OBSVideoSource(settings.obs_host, settings.obs_port, settings.obs_password,
+                                settings.obs_source, settings.frame_width, settings.frame_height)
+    else:
+        video_worker = None
+        return
+    video_worker = VideoWorker(source, controller, Path(settings.calibration_path),
+                               settings.frame_fps, settings.ocr_interval, settings.color_interval)
+    video_task = asyncio.create_task(video_worker.run())
+
+
+def _persist(values: Mapping[str, object]) -> None:
+    save_local_settings(Path(".env"), values)
+    for key, value in values.items():
+        setattr(settings, key, value)
+
+
+class TSHSelection(BaseModel):
+    url: str
+    scoreboard: int = 1
+
+
+class OBSSelection(BaseModel):
+    host: str = "127.0.0.1"
+    port: int = 4455
+    source: str = ""
+    password: str = ""
+
+
+class StartGGSelection(BaseModel):
+    token: str = ""
+    tournament: str = ""
+    stream: str = ""
+
+
+@app.get("/setup", response_class=HTMLResponse)
+def setup_page():
+    return Path(__file__).with_name("setup.html").read_text(encoding="utf-8")
+
+
+@app.get("/api/setup/discover")
+async def setup_discover():
+    tsh, obs = await asyncio.gather(discover_tsh(settings), discover_obs(settings))
+    return {"tsh": tsh, "obs": obs, "configured": {
+        "demo": settings.demo, "tsh_url": settings.tsh_url, "obs_source": settings.obs_source,
+        "startgg_token_masked": "••••" + settings.startgg_token[-4:] if settings.startgg_token else None,
+        "startgg_tournament_slug": settings.startgg_tournament_slug,
+        "startgg_stream_name": settings.startgg_stream_name},
+        "tsh_launch_hint": "If TSH reports missing ./user_data/settings.json, launch TSH.exe with its extracted folder as the working directory."}
+
+
+@app.post("/api/setup/tsh")
+async def select_tsh(body: TSHSelection):
+    from urllib.parse import urlparse
+    parsed = urlparse(body.url)
+    if parsed.scheme != "http" or parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        raise HTTPException(400, "TSH setup accepts local HTTP addresses only")
+    if not 1 <= body.scoreboard <= 8:
+        raise HTTPException(400, "Invalid scoreboard number")
+    result = await probe_selected_tsh(body.url, body.scoreboard)
+    if result["status"] != "PASS":
+        raise HTTPException(409, result.get("error", "TSH unavailable"))
+    _persist({"tsh_url": body.url, "tsh_scoreboard": body.scoreboard, "demo": False})
+    controller.tsh = TSHWebAdapter(body.url, body.scoreboard)
+    controller.armed = False
+    controller.match = None
+    controller.score_snapshot = None
+    return result
+
+
+async def probe_selected_tsh(url: str, scoreboard: int) -> dict:
+    from .setup_wizard import probe_tsh
+    return await probe_tsh(url, scoreboard)
+
+
+@app.post("/api/setup/obs")
+async def select_obs(body: OBSSelection):
+    if body.host not in {"localhost", "127.0.0.1", "::1"} or not 1 <= body.port <= 65535:
+        raise HTTPException(400, "OBS setup accepts local WebSocket addresses only")
+    if not body.source.strip():
+        raise HTTPException(400, "Choose an OBS source")
+    result, preview = await test_obs_frame(body.host, body.port, body.password, body.source)
+    if result["status"] != "PASS":
+        raise HTTPException(409, result.get("error", "OBS frame unavailable"))
+    global setup_preview, setup_frame_result
+    setup_preview, setup_frame_result = preview, result
+    _persist({"obs_host": body.host, "obs_port": body.port, "obs_source": body.source,
+              "obs_password": body.password, "recorded_video": ""})
+    controller.armed = False
+    await _reconfigure_video()
+    return result
+
+
+@app.get("/api/setup/preview")
+def setup_preview_frame():
+    if not setup_preview:
+        raise HTTPException(404, "No tested OBS frame")
+    return Response(setup_preview, media_type="image/jpeg")
+
+
+@app.post("/api/setup/startgg")
+async def select_startgg(body: StartGGSelection):
+    try:
+        slug = tournament_slug(body.tournament) if body.tournament else ""
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    token = body.token.strip() or settings.startgg_token
+    result = await probe_startgg(token, slug, body.stream)
+    if result["authentication"] != "PASS":
+        raise HTTPException(409, result.get("error", "Start.gg token invalid"))
+    if slug and result.get("tournament") != "PASS":
+        _persist({"startgg_token": token})
+        return result
+    if body.stream and result.get("stream") != "PASS":
+        _persist({"startgg_token": token, "startgg_tournament_slug": slug})
+        return result
+    values = {"startgg_token": token, "startgg_tournament_slug": slug,
+              "startgg_stream_name": body.stream}
+    _persist(values)
+    return result
+
+
+@app.post("/api/setup/validate")
+async def setup_validate():
+    tsh, obs = await asyncio.gather(discover_tsh(settings), discover_obs(settings))
+    startgg = await probe_startgg(settings.startgg_token, settings.startgg_tournament_slug,
+                                   settings.startgg_stream_name)
+    frame = setup_frame_result
+    if settings.obs_source and any(item["status"] == "PASS" for item in obs):
+        frame, _ = await test_obs_frame(settings.obs_host, settings.obs_port,
+                                        settings.obs_password, settings.obs_source)
+    ready = readiness(tsh, obs, frame, startgg, Path(settings.calibration_path), settings)
+    if controller.external_score_change:
+        ready["blocking"].append("Review the external TSH score change")
+        ready["status"] = "NOT_READY"
+    performance = ({**process_sampler.sample(), **video_worker.telemetry()}
+                   if video_worker else process_sampler.sample())
+    performance["status"] = ("NOT_MEASURED" if not video_worker or
+                             performance.get("analysis_fps", 0) == 0 else
+                             "PASS" if performance["analysis_fps"] >= settings.frame_fps * .8
+                             and performance.get("dropped_analysis_frames", 0) == 0 else "REVIEW")
+    active_profile, profiles = calibration_profiles(Path(settings.calibration_path))
+    return {"tsh": tsh, "obs": obs, "frame": frame, "startgg": startgg,
+            "calibration": {"profiles": profiles, "active": active_profile,
+                            "suggested": active_profile if load_calibration(
+                                Path(settings.calibration_path)).rois else None,
+                            "needs_review": True},
+            "performance": performance, "readiness": ready,
+            "external_score_change": controller.external_score_change}
+
+
+class DisposableScoreTest(BaseModel):
+    side: Side
+    disposable: bool
+
+
+@app.post("/api/setup/tsh-score-test")
+async def setup_score_test(body: DisposableScoreTest):
+    if not body.disposable or controller.shadow_mode:
+        raise HTTPException(409, "Select a disposable scoreboard and leave shadow mode first")
+    async with controller.lock:
+        before = await _do(controller.tsh.get_current_set())
+        if before.set_id in ("", "0", "None") or before.left.display_name == "?" or before.right.display_name == "?":
+            raise HTTPException(409, "Load a valid disposable two-player set first")
+        if before.complete:
+            raise HTTPException(409, "Use an incomplete disposable set")
+        original_set_id = before.set_id
+        original_left, original_right = before.left_score, before.right_score
+        left = original_left + (body.side == Side.LEFT)
+        right = original_right + (body.side == Side.RIGHT)
+        controller.armed = False
+        try:
+            await controller.tsh.set_score(int(left), int(right))
+            changed = await controller.tsh.get_current_set()
+            if (changed.set_id, changed.left_score, changed.right_score) != (original_set_id, left, right):
+                raise RuntimeError("Score increment readback failed; review TSH manually")
+            await controller.tsh.set_score(original_left, original_right)
+            restored = await controller.tsh.get_current_set()
+            if (restored.set_id, restored.left_score, restored.right_score) != (
+                    original_set_id, original_left, original_right):
+                raise RuntimeError("Score restore readback failed; review TSH manually")
+        except Exception as exc:
+            controller.armed = False
+            controller.store.log("setup_score_test_uncertain", {"error": str(exc)})
+            raise HTTPException(409, str(exc)) from exc
+        controller.score_snapshot = (original_set_id, original_left, original_right)
+        controller.store.log("setup_score_test_pass", {"set_id": original_set_id, "side": body.side.value})
+        return {"status": "PASS", "original_score": [original_left, original_right],
+                "restored_score": [restored.left_score, restored.right_score]}
+
+
+class ShadowRequest(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/setup/shadow")
+def set_shadow(body: ShadowRequest):
+    controller.set_shadow_mode(body.enabled)
+    return {"shadow_mode": controller.shadow_mode, "armed": controller.armed}
+
+
+@app.get("/api/setup/rehearsal-report")
+def rehearsal_report():
+    import json
+    from collections import Counter
+    events = [event for event in reversed(controller.store.recent(1000))
+              if controller.shadow_started_at and event["created"] >= controller.shadow_started_at]
+    parsed = [{"created": event["created"], "kind": event["kind"],
+               "detail": json.loads(event["detail"])} for event in events]
+    ends = [event["detail"]["event_id"] for event in parsed if event["kind"] == "game_end"]
+    predictions = [event["detail"] for event in parsed if event["kind"] == "would_score"]
+    counts = Counter(item["event_id"] for item in predictions)
+    summary = {"games_observed": len(ends), "game_ends": len(ends),
+               "winner_predictions": [item["winner"] for item in predictions],
+               "mapping_confident": sum(item["mapping_confidence"] >=
+                                        settings.min_mapping_confidence for item in predictions),
+               "would_be_tsh_updates": len(predictions),
+               "duplicate_events": sum(count - 1 for count in counts.values()),
+               "unknown_or_unscored": len(set(ends) - set(counts)),
+               "obs_disconnects": sum(event["kind"] == "video_disconnected" for event in parsed),
+               "tsh_errors": sum(event["kind"] in {"score_uncertain", "tsh_disconnected"}
+                                 for event in parsed),
+               "external_score_changes": sum(event["kind"] == "external_score_change" for event in parsed)}
+    path = Path("diagnostics/rehearsal-live.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"summary": summary, "events": parsed}, indent=2), encoding="utf-8")
+    path.with_suffix(".md").write_text("# Shadow rehearsal\n\n" + "\n".join(
+        f"- {key.replace('_', ' ').title()}: {value}" for key, value in summary.items()) + "\n",
+        encoding="utf-8")
+    return {"summary": summary, "json": str(path), "markdown": str(path.with_suffix('.md'))}
+
+
+@app.post("/api/setup/accept-external-score")
+def accept_external_score():
+    try:
+        controller.accept_external_score()
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"status": "ACCEPTED", "armed": controller.armed}
+
+
+@app.post("/api/setup/reconcile-score")
+async def reconcile_score():
+    return await _do(controller.reconcile_uncertain_score())
 
 
 async def next_set_loop():
@@ -311,6 +583,8 @@ async def test_region(name: str):
 
 @app.post("/api/arm/{armed}")
 async def arm(armed: bool):
+    if armed and (controller.shadow_mode or controller.external_score_change):
+        raise HTTPException(409, "Resolve shadow mode or external score review before arming")
     controller.armed = armed
     controller.store.log("auto_score_arm", {"armed": armed})
     return {"armed": armed}
@@ -354,6 +628,8 @@ async def mode(body: ModeRequest):
 
 @app.post("/api/swap")
 async def swap():
+    if controller.shadow_mode:
+        raise HTTPException(409, "Shadow mode blocks TSH player swaps")
     await _do(controller.tsh.swap_players())
     await _do(controller.refresh())
     controller.previous_mapping = controller.manual_mapping = None

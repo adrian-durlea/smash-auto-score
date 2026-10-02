@@ -19,7 +19,7 @@ smash-auto-score = "smash_auto_score.app:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-smash_auto_score = ["dashboard.html"]
+smash_auto_score = ["dashboard.html", "setup.html"]
 
 [tool.ruff]
 line-length = 100

@@ -112,6 +112,8 @@ class VideoWorker:
                 frame = await self.source.frame()
                 captured = True
                 self._captures.append(time.monotonic())
+                if not self.connected:
+                    self.controller.store.log("video_connected", {})
                 self.connected = True
                 self.error = None
                 ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
@@ -165,10 +167,13 @@ class VideoWorker:
             except EOFError:
                 self.connected = False
                 self.error = "Recording ended"
+                self.controller.store.log("video_ended", {})
                 return
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - video source must reconnect
+                if self.connected:
+                    self.controller.store.log("video_disconnected", {"error": str(exc)[:160]})
                 self.connected = captured
                 self.error = str(exc)
                 self.controller.armed = False

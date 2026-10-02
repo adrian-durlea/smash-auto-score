@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Smash AutoScore Setup</title>
+<style>
+body{font:16px system-ui;background:#101827;color:#eef3fb;margin:0 auto;max-width:1050px;padding:24px}a{color:#8bd3ff}
+h1{margin-bottom:4px}h2{margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:16px}
+.card{background:#1b293c;border:1px solid #39485c;border-radius:10px;padding:18px;margin:12px 0}button,input,select{font:inherit;padding:8px;margin:5px 3px 5px 0;border-radius:5px}
+button{background:#2274c9;border:0;color:white;cursor:pointer}button.secondary{background:#49566a}input,select{background:#0d1725;color:white;border:1px solid #61758a;max-width:95%}
+.good{color:#83e2ab}.bad{color:#ffa6a6}.warn{color:#ffe092}pre{white-space:pre-wrap;overflow-wrap:anywhere}img{max-width:100%;border:1px solid #536174}
+label{display:block;margin:5px 0}.muted{color:#afbed0;font-size:.9em}.row{padding:6px 0;border-bottom:1px solid #354358}
+</style>
+<h1>Smash AutoScore Setup</h1><p><a href="/">← Dashboard</a> · Read-only discovery runs first. Automatic scoring stays disarmed.</p>
+<p id="notice" class="warn"></p>
+<button onclick="discover()">Discover local integrations</button><button onclick="validate()">Run full read-only validation</button>
+<div id="readiness" class="card">Run discovery to begin.</div>
+<div class="grid">
+<section class="card"><h2>TSH</h2><div id="tsh">Searching…</div><label>Discovered instance <select id="tsh-choice"></select></label><button onclick="useTsh()">Use this TSH</button>
+<p class="muted">If TSH says <code>./user_data/settings.json</code> is missing, start its EXE from the extracted TSH folder. The file must be in that folder's <code>user_data</code> directory.</p>
+<label><input type="checkbox" id="disposable"> I am using a disposable test scoreboard; its score may change briefly.</label><select id="test-side"><option value="left">Left</option><option value="right">Right</option></select><button class="secondary" onclick="scoreTest()">Run disposable score test</button><div id="score-test"></div></section>
+<section class="card"><h2>OBS</h2><div id="obs">Searching…</div><label>WebSocket <select id="obs-choice" onchange="showSources()"></select></label>
+<label>Source <select id="source-choice"></select></label><label>Password, only if OBS requires it <input id="obs-password" type="password" autocomplete="off"></label>
+<button onclick="useObs()">Test frames and use source</button><div id="frame-test"></div><img id="preview" alt="OBS source preview" hidden>
+<p class="muted">If WebSocket is disabled: OBS → Tools → WebSocket Server Settings → Enable WebSocket server. Choose a gameplay or capture source after reviewing the preview.</p></section>
+<section class="card"><h2>Start.gg <small>(optional)</small></h2><div id="startgg"></div>
+<label>Personal API token <input id="token" type="password" autocomplete="off"></label><p class="muted">Create a personal token in your start.gg account's Developer Settings. It is saved locally in the ignored <code>.env</code> file and shown here only as a masked suffix.</p>
+<label>Tournament URL or slug <input id="tournament" placeholder="https://www.start.gg/tournament/.../details"></label>
+<label>Stream <select id="stream"><option value="">Select after testing tournament</option></select></label>
+<button onclick="useStartgg()">Validate and save</button></section>
+<section class="card"><h2>Calibration and rehearsal</h2><div id="calibration"></div><p><a href="/">Review calibration in the dashboard</a>. Profiles are suggested from saved calibration; review actual frames before scoring.</p>
+<label><input type="checkbox" id="shadow" onchange="setShadow()"> Shadow mode: predict without TSH writes</label>
+<button onclick="startRehearsal()">Start shadow rehearsal</button><button class="secondary" onclick="report()">Save rehearsal report</button><pre id="rehearsal"></pre></section>
+<section class="card"><h2>Score recovery</h2><p class="muted">If TSH changed outside AutoScore, review its current score before accepting it. An uncertain AutoScore write can be checked against TSH without retrying.</p><button onclick="recover()">Check uncertain write</button><button class="secondary" onclick="acceptExternal()">Accept current external score</button><pre id="recovery"></pre></section>
+</div><section class="card"><h2>Validation details</h2><pre id="details"></pre></section>
+<script>
+const $=id=>document.getElementById(id);let found={tsh:[],obs:[]};
+async function call(url,body){const options=body===undefined?{}:{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)};try{let r=await fetch(url,options),data=await r.json();if(!r.ok)throw Error(data.detail||r.statusText);$('notice').textContent='';return data}catch(e){$('notice').textContent=String(e);return null}}
+function status(item){return item?.status||'NOT FOUND'}
+async function discover(){let data=await call('/api/setup/discover');if(!data)return;found=data;$('tsh').textContent=data.tsh.length?`${data.tsh.length} local instance(s) found`:'No TSH web server found. Open TSH and enable its web server.';
+$('tsh-choice').replaceChildren(...data.tsh.map((v,i)=>new Option(`${v.url} — ${v.set.players.join(' vs ')} ${v.set.score.join('-')}`,i)));
+$('obs').textContent=data.obs.length?`${data.obs.length} OBS WebSocket endpoint(s) found`:'No OBS WebSocket found on local configured/default ports.';
+$('obs-choice').replaceChildren(...data.obs.map((v,i)=>new Option(`${v.host}:${v.port} — ${status(v)} ${v.version||''}`,i)));showSources();
+$('startgg').textContent=data.configured.startgg_token_masked?`Saved token: ${data.configured.startgg_token_masked}`:'No token saved';
+$('tournament').value=data.configured.startgg_tournament_slug||data.tsh.find(v=>v.tournament_suggestion)?.tournament_suggestion||'';if(data.configured.startgg_stream_name)$('stream').replaceChildren(new Option(data.configured.startgg_stream_name,data.configured.startgg_stream_name));if(data.tsh.length===1&&(data.configured.demo||data.configured.tsh_url!==data.tsh[0].url))await useTsh();let reachable=data.obs.filter(v=>v.status==='PASS');if(reachable.length===1&&reachable[0].sources.filter(v=>v.likely_gameplay).length===1&&!data.configured.obs_source){$('obs-choice').value=String(data.obs.indexOf(reachable[0]));showSources();await useObs()}}
+function showSources(){let item=found.obs[Number($('obs-choice').value)];$('source-choice').replaceChildren(...(item?.sources||[]).map(v=>new Option(`${v.name} (${v.kind})${v.likely_gameplay?' ★':''}`,v.name)));if(item?.recommended_source)$('source-choice').value=item.recommended_source}
+async function useTsh(){let item=found.tsh[Number($('tsh-choice').value)];if(!item)return;$('details').textContent=JSON.stringify(await call('/api/setup/tsh',{url:item.url,scoreboard:item.scoreboard}),null,2)}
+async function useObs(){let item=found.obs[Number($('obs-choice').value)];if(!item)return;let result=await call('/api/setup/obs',{host:item.host,port:item.port,source:$('source-choice').value,password:$('obs-password').value});if(result){$('obs-password').value='';$('frame-test').textContent=`${status(result)} — ${result.width}×${result.height}, ${result.frames} frames, ${result.average_latency_ms} ms average`;$('preview').src='/api/setup/preview?t='+Date.now();$('preview').hidden=false}}
+async function useStartgg(){let result=await call('/api/setup/startgg',{token:$('token').value,tournament:$('tournament').value,stream:$('stream').value});$('token').value='';if(!result)return;$('startgg').textContent=`Authentication ${result.authentication}; tournament ${result.tournament}; stream ${result.stream}`;$('stream').replaceChildren(new Option('Choose stream',''),...(result.streams||[]).map(s=>new Option(`${s.name} (${s.sets.length} queued)`,s.name)));if((result.streams||[]).length===1)$('stream').value=result.streams[0].name;$('details').textContent=JSON.stringify(result,null,2)}
+async function scoreTest(){if(!$('disposable').checked){$('notice').textContent='Confirm this is a disposable scoreboard first.';return}let result=await call('/api/setup/tsh-score-test',{side:$('test-side').value,disposable:true});if(result)$('score-test').textContent=`${result.status}: restored to ${result.restored_score.join('-')}`}
+async function validate(){let result=await call('/api/setup/validate');if(!result)return;let ready=result.readiness;$('readiness').innerHTML=`<strong class="${ready.status==='READY_FOR_REHEARSAL'?'good':'bad'}">${ready.status.replaceAll('_',' ')}</strong><p>Blocking: ${ready.blocking.join('; ')||'none'}</p><p>Warnings: ${ready.warnings.join('; ')||'none'}</p>`;$('calibration').textContent=`Saved profiles: ${result.calibration.profiles.join(', ')||'none'}. Suggested for review: ${result.calibration.suggested||'none'}.`;if(result.calibration.suggested){let b=document.createElement('button');b.textContent='Use saved profile';b.onclick=()=>call('/api/calibration/profile/'+encodeURIComponent(result.calibration.suggested),{});$('calibration').appendChild(b)}$('details').textContent=JSON.stringify(result,null,2)}
+async function setShadow(){let result=await call('/api/setup/shadow',{enabled:$('shadow').checked});if(result)$('rehearsal').textContent=result.shadow_mode?'Shadow mode active. Automatic TSH writes are blocked.':'Shadow mode stopped.'}
+async function startRehearsal(){$('shadow').checked=true;await setShadow();$('rehearsal').textContent='Shadow rehearsal running. Play a set, compare each prediction manually, then save the report.'}
+async function report(){let result=await call('/api/setup/rehearsal-report');if(result)$('rehearsal').textContent=JSON.stringify(result,null,2)}
+async function recover(){let result=await call('/api/setup/reconcile-score',{});if(result)$('recovery').textContent=JSON.stringify(result,null,2)}
+async function acceptExternal(){let result=await call('/api/setup/accept-external-score',{});if(result)$('recovery').textContent=JSON.stringify(result,null,2)}
+discover();
+</script></html>
