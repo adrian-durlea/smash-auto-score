@@ -75,4 +75,15 @@ class Observation:
     result_screen: bool | None = False
     winner: Slot | None = None
     winner_confidence: float = 0.0
+    winner_evidence: list[str] = field(default_factory=list)
+    result_confidence: float = 0.0
+    end_evidence: list[str] = field(default_factory=list)
+    hud_visible: bool = False
     timestamp: float = 0.0
+
+
+@dataclass
+class GameEndDetection:
+    ended: bool = False
+    confidence: float = 0.0
+    evidence: list[str] = field(default_factory=list)

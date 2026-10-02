@@ -19,6 +19,10 @@ class Controller:
     def __init__(self, tsh: TSHAdapter, store: Store, settings: Settings):
         self.tsh, self.store, self.settings = tsh, store, settings
         self.machine = GameStateMachine()
+        self.machine.end_confirmation_frames = settings.game_end_confirmation_frames
+        self.machine.winner_confirmation_frames = settings.winner_confirmation_frames
+        self.machine.new_game_confirmation_frames = settings.new_game_confirmation_frames
+        self.machine.post_game_lockout_seconds = settings.post_game_lockout_seconds
         self.armed = False
         self.set_mode = Mode.SUGGEST
         self.swap_mode = Mode.SUGGEST
@@ -39,9 +43,14 @@ class Controller:
         self.set_complete_at: float | None = None
         self.next_dismissed = False
         self.auto_swapped_set_id: str | None = None
+        self.handled_end_events: set[str] = set()
+        self.last_tsh_ms = 0.0
+        self.last_state_ms = 0.0
 
     async def refresh(self) -> SetInfo:
+        started = time.perf_counter()
         match = await self.tsh.get_current_set()
+        self.last_tsh_ms = (time.perf_counter() - started) * 1000
         await self.player_data.enrich(match.left)
         await self.player_data.enrich(match.right)
         await self.supermajor.enrich(match.left)
@@ -55,6 +64,7 @@ class Controller:
             self.set_complete_at = None
             self.next_dismissed = False
             self.auto_swapped_set_id = None
+            self.handled_end_events.clear()
             self.store.log("set_changed", {"set_id": match.set_id})
         if match.complete and self.set_complete_at is None:
             self.set_complete_at = time.time()
@@ -69,10 +79,28 @@ class Controller:
             self.error = None
         except Exception as exc:  # noqa: BLE001 - status must survive adapter failures
             self.error = str(exc)
+            self.armed = False
             log.warning("TSH read failed: %s", exc)
+        ready = (self.armed and self.error is None and self.machine.phase == GamePhase.RESULT
+                 and self.machine.end_detection.confidence >=
+                 self.settings.game_end_confidence_threshold
+                 and self.machine.winner is not None
+                 and self.machine.winner_confidence >= self.settings.min_winner_confidence
+                 and self.mapping.p1_is_left is not None
+                 and self.mapping.confidence >= self.settings.min_mapping_confidence)
+        mapped_competitor = None
+        if self.match and self.machine.winner and self.mapping.p1_is_left is not None:
+            left_won = (self.machine.winner == Slot.P1) == self.mapping.p1_is_left
+            mapped_competitor = (self.match.left if left_won else self.match.right).display_name
         return {"connected": self.error is None, "error": self.error,
                 "set": asdict(self.match) if self.match else None,
                 "phase": self.machine.phase.value, "generation": self.machine.generation,
+                "game_end": asdict(self.machine.end_detection),
+                "winner": {"slot": self.machine.winner.value if self.machine.winner else None,
+                           "confidence": self.machine.winner_confidence,
+                           "evidence": self.machine.winner_evidence,
+                           "mapped_competitor": mapped_competitor},
+                "auto_score_ready": ready,
                 "armed": self.armed, "set_mode": self.set_mode.value,
                 "swap_mode": self.swap_mode.value,
                 "swap_suggested": self.mapping.p1_is_left is False and
@@ -84,7 +112,11 @@ class Controller:
 
     async def ingest(self, obs: Observation) -> None:
         async with self.lock:
-            match = await self.refresh()
+            try:
+                match = await self.refresh()
+            except Exception:
+                self.armed = False
+                raise
             self.observation = obs
             self.mapping = map_players(match, obs, self.previous_mapping)
             if self.manual_mapping is not None:
@@ -106,21 +138,34 @@ class Controller:
                 self.previous_mapping = True
                 self.mapping = MappingDecision(True, self.mapping.confidence, self.mapping.evidence)
                 self.store.log("auto_players_swapped", {"set_id": match.set_id})
+            state_started = time.perf_counter()
             confirmed_end = self.machine.observe(obs)
+            self.last_state_ms = (time.perf_counter() - state_started) * 1000
             if self.mapping.p1_is_left is not None and self.mapping.confidence >= self.settings.min_mapping_confidence:
                 self.previous_mapping = self.mapping.p1_is_left
             if confirmed_end:
                 event_id = f"{match.set_id}:{self.machine.generation}"
-                self.store.log("game_end", {"event_id": event_id, "winner": obs.winner.value if obs.winner else None})
-                if (self.armed and obs.winner is not None
-                        and obs.winner_confidence >= self.settings.min_winner_confidence
+                self.store.log("game_end", {"event_id": event_id,
+                               "evidence": asdict(self.machine.end_detection)})
+            if self.machine.end_detection.ended:
+                event_id = f"{match.set_id}:{self.machine.generation}"
+                if (event_id not in self.handled_end_events and self.armed
+                        and self.machine.end_detection.confidence >=
+                        self.settings.game_end_confidence_threshold
+                        and self.machine.winner is not None
+                        and self.machine.winner_confidence >= self.settings.min_winner_confidence
                         and self.mapping.p1_is_left is not None
-                        and self.mapping.confidence >= self.settings.min_mapping_confidence):
-                    side = Side.LEFT if ((obs.winner == Slot.P1) == self.mapping.p1_is_left) else Side.RIGHT
+                        and self.mapping.confidence >= self.settings.min_mapping_confidence
+                        and self.machine.phase == GamePhase.RESULT):
+                    side = Side.LEFT if ((self.machine.winner == Slot.P1) ==
+                                         self.mapping.p1_is_left) else Side.RIGHT
+                    self.handled_end_events.add(event_id)
                     await self._score(event_id, side, automatic=True)
-                else:
+                elif (event_id not in self.handled_end_events and
+                      (not self.armed or self.machine.phase == GamePhase.POST_GAME)):
+                    self.handled_end_events.add(event_id)
                     self.store.log("confirmation_required", {"event_id": event_id,
-                                   "winner_confidence": obs.winner_confidence,
+                                   "winner_confidence": self.machine.winner_confidence,
                                    "mapping_confidence": self.mapping.confidence})
 
     async def _score(self, event_id: str, side: Side, automatic: bool) -> bool:
@@ -159,7 +204,19 @@ class Controller:
     async def manual_score(self, side: Side) -> bool:
         async with self.lock:
             import uuid
-            return await self._score(f"manual:{uuid.uuid4()}", side, automatic=False)
+            applied = await self._score(f"manual:{uuid.uuid4()}", side, automatic=False)
+            if applied and self.match and self.machine.end_detection.ended:
+                event_id = f"{self.match.set_id}:{self.machine.generation}"
+                self.handled_end_events.add(event_id)
+                if self.machine.winner and self.mapping.p1_is_left is not None:
+                    predicted = Side.LEFT if ((self.machine.winner == Slot.P1) ==
+                                              self.mapping.p1_is_left) else Side.RIGHT
+                    if predicted != side:
+                        self.store.log("winner_prediction_error", {
+                            "event_id": event_id, "predicted_side": predicted.value,
+                            "actual_side": side.value,
+                            "winner_evidence": self.machine.winner_evidence})
+            return applied
 
     async def undo(self) -> bool:
         async with self.lock:

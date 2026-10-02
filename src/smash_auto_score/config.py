@@ -21,6 +21,14 @@ class Settings(BaseSettings):
     supermajor_min_games: int = 20
     min_mapping_confidence: float = 0.95
     min_winner_confidence: float = 0.97
+    game_end_confidence_threshold: float = 0.97
+    game_end_confirmation_frames: int = 2
+    winner_confirmation_frames: int = 2
+    new_game_confirmation_frames: int = 3
+    post_game_lockout_seconds: float = 5.0
+    performance_telemetry_enabled: bool = True
+    winner_diagnostics_enabled: bool = False
+    winner_diagnostics_path: str = "diagnostics/winner"
     min_set_confidence: float = 0.97
     min_set_margin: float = 0.20
     post_set_delay_seconds: float = 15.0

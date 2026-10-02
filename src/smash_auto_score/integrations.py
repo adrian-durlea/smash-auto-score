@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import logging
+import time
 from pathlib import Path
 from typing import Protocol
 
@@ -178,6 +179,7 @@ class OBSVideoSource:
                  height: int = 540):
         self.host, self.port, self.password, self.source = host, port, password, source
         self.width, self.height = width, height
+        self.last_roundtrip_ms = 0.0
 
     async def frame(self) -> np.ndarray:
         import obsws_python as obs
@@ -188,7 +190,9 @@ class OBSVideoSource:
                 return base64.b64decode(data.image_data.split(",", 1)[-1])
             finally:
                 client.disconnect()
+        started = time.perf_counter()
         buffer = await asyncio.to_thread(capture)
+        self.last_roundtrip_ms = (time.perf_counter() - started) * 1000
         image = cv2.imdecode(np.frombuffer(buffer, np.uint8), cv2.IMREAD_COLOR)
         if image is None:
             raise ValueError("OBS returned an undecodable image")
