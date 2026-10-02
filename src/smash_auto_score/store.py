@@ -48,6 +48,10 @@ class Store:
         row = self.db.execute("SELECT value,expires FROM profiles WHERE key=?", (key,)).fetchone()
         return json.loads(row["value"]) if row and row["expires"] > time.time() else None
 
+    def cache_entry(self, key: str) -> tuple[dict, float] | None:
+        row = self.db.execute("SELECT value,expires FROM profiles WHERE key=?", (key,)).fetchone()
+        return (json.loads(row["value"]), float(row["expires"])) if row else None
+
     def cache_put(self, key: str, value: dict, ttl: float) -> None:
         self.db.execute("INSERT OR REPLACE INTO profiles VALUES(?,?,?)",
                         (key, json.dumps(value), time.time() + ttl))
