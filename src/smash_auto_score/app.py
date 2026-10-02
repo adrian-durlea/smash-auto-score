@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -21,7 +22,13 @@ from .integrations import (
 )
 from .store import Store
 from .vision import ROI, Calibration, TesseractOCR, dominant_color
-from .worker import VideoWorker, load_calibration, save_calibration
+from .worker import (
+    VideoWorker,
+    activate_profile,
+    calibration_profiles,
+    load_calibration,
+    save_calibration,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 settings = Settings()
@@ -47,7 +54,13 @@ async def lifespan(_app: FastAPI):
     except Exception as exc:  # noqa: BLE001 - external service may fail in many ways
         logging.getLogger(__name__).warning("Initial TSH read failed: %s", exc)
     task = asyncio.create_task(video_worker.run()) if video_worker else None
+    next_task = asyncio.create_task(next_set_loop())
     yield
+    next_task.cancel()
+    try:
+        await next_task
+    except asyncio.CancelledError:
+        pass
     if task:
         task.cancel()
         try:
@@ -59,12 +72,46 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="Smash AutoScore", lifespan=lifespan)
 
 
+async def next_set_loop():
+    assigned_cache: set[str] | None = None
+    assigned_fetched_at = 0.0
+    last_candidate_check = 0.0
+    while True:
+        await asyncio.sleep(2)
+        try:
+            match = await controller.refresh()
+            if (match.complete and controller.set_mode != Mode.OFF
+                    and not controller.next_dismissed and controller.set_complete_at is not None
+                    and time.time() - controller.set_complete_at >= settings.post_set_delay_seconds
+                    and (not controller.next_candidate or
+                         (controller.set_mode == Mode.AUTO and controller.observation.game_active))
+                    and time.time() - last_candidate_check >= 10):
+                last_candidate_check = time.time()
+                if (settings.startgg_token and settings.startgg_tournament_slug and settings.startgg_stream_name
+                        and time.time() - assigned_fetched_at >= 60):
+                    assigned_cache = await StartGGProvider(settings.startgg_token).stream_set_ids(
+                        settings.startgg_tournament_slug, settings.startgg_stream_name)
+                    assigned_fetched_at = time.time()
+                await controller.suggest_next_set(assigned_cache)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - polling must survive external failures
+            logging.getLogger(__name__).warning("Next-set poll failed: %s", exc)
+
+
 class MappingRequest(BaseModel):
     p1_is_left: bool
 
 
 class ModeRequest(BaseModel):
     mode: Mode
+
+
+@app.post("/api/swap-mode")
+async def swap_mode(body: ModeRequest):
+    controller.swap_mode = body.mode
+    controller.store.log("swap_mode", {"mode": body.mode.value})
+    return {"mode": body.mode.value}
 
 
 class ReplayObservation(BaseModel):
@@ -114,6 +161,23 @@ async def calibration():
     return load_calibration(Path(settings.calibration_path))
 
 
+@app.get("/api/calibration/profiles")
+async def profiles():
+    active, names = calibration_profiles(Path(settings.calibration_path))
+    return {"active": active, "profiles": names}
+
+
+@app.post("/api/calibration/profile/{name}")
+async def profile(name: str):
+    try:
+        activate_profile(Path(settings.calibration_path), name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if video_worker:
+        video_worker.reload_calibration()
+    return {"active": name}
+
+
 class PlayerOverrideRequest(BaseModel):
     side: Side
     aliases: list[str] = []
@@ -138,7 +202,8 @@ class CalibrationRequest(BaseModel):
 
 @app.put("/api/calibration")
 async def update_calibration(body: CalibrationRequest):
-    allowed = {"p1_tag", "p2_tag", "p1_hud", "p2_hud", "gameplay", "game_set", "result", "winner"}
+    allowed = {"p1_tag", "p2_tag", "p1_hud", "p2_hud", "p1_character", "p2_character",
+               "gameplay", "game_set", "result", "winner"}
     if not set(body.rois).issubset(allowed):
         raise HTTPException(400, "Unknown ROI name")
     for roi in body.rois.values():
@@ -157,13 +222,19 @@ async def test_region(name: str):
     if not roi or not video_worker or not video_worker.latest_frame:
         raise HTTPException(404, "Region or frame unavailable")
     frame = cv2.imdecode(np.frombuffer(video_worker.latest_frame, np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise HTTPException(503, "Cannot decode current frame")
     crop = roi.crop(frame)
     if name.endswith("hud"):
         return {"color": dominant_color(crop)}
+    if name.endswith("character") and video_worker:
+        slot = Slot.P1 if name.startswith("p1") else Slot.P2
+        character, confidence = video_worker.detector.characters.detect(crop, slot)
+        return {"character": character, "confidence": confidence}
     try:
         value, confidence = await asyncio.to_thread(TesseractOCR().read, crop)
         return {"text": value, "confidence": confidence}
-    except Exception as exc:  # noqa: BLE001 - OCR binary may be absent
+    except Exception as exc:
         raise HTTPException(503, f"OCR unavailable: {exc}") from exc
 
 
@@ -239,6 +310,7 @@ async def load():
 @app.post("/api/next/ignore")
 async def ignore():
     controller.next_candidate = None
+    controller.next_dismissed = True
     return {"ok": True}
 
 

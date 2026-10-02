@@ -6,6 +6,8 @@ A local broadcast controller for Super Smash Bros. Ultimate tournaments. It help
 
 Auto score starts **disarmed**. Next set mode starts at **SUGGEST**. An automatic point requires a confirmed game end, a slot winner above the winner threshold, and a two hypothesis player mapping above the mapping threshold. Conflicting evidence caps mapping confidence. If a TSH write cannot be verified, automation disarms and the transaction is marked uncertain for operator review. A game generation and persisted event ID prevent duplicate points while an end screen remains visible. Undo checks the current set and expected score before reversing a transaction.
 
+After set completion, candidate refresh waits 15 seconds by default. AUTO set loading additionally requires fresh active game observations after that delay, plus the configured confidence and margin. The operator can dismiss a suggestion for the current set.
+
 The winner detector accepts only explicit `P1 WINS` or `P2 WINS` text in a calibrated winner region at very high OCR confidence. Typical Smash result screens may not show that text, so out of the box auto score remains inert while manual scoring and replayed observations work. This is a functioning operator MVP and detection framework, not a claim of fully autonomous broadcast scoring.
 
 ## Architecture
@@ -59,7 +61,7 @@ Supermajor enrichment is **not active**. Public access to a stable player charac
 
 ## Calibration
 
-The dashboard calibration card displays the latest frame. Drag rectangles for each region (`p1_tag`, `p2_tag`, `p1_hud`, `p2_hud`, `gameplay`, `game_set`, `result`, `winner`) and save. Coordinates are normalized and stored at `SAS_CALIBRATION_PATH`. Tesseract OCR must be installed separately and available on `PATH` for text detection. Test crops against actual footage, overlays, transition screens, and different stages before arming automation. The current generic gameplay detector uses image variance and is experimental; winner association requires explicit slot text in its own region.
+The dashboard calibration card displays the latest frame. Create named profiles, drag rectangles for tag, HUD, character, gameplay, game set, result, and winner regions, and save. Coordinates are normalized and stored at `SAS_CALIBRATION_PATH`. Tesseract OCR must be installed separately and available on `PATH` for text detection. Test crops against actual footage, overlays, transition screens, and different stages before arming automation. The current generic gameplay detector uses image variance and is experimental; winner association requires explicit slot text in its own region. The character detector is an interface only and currently returns unknown.
 
 ## Tests and development
 
@@ -77,3 +79,9 @@ SQLite stores score transactions and event logs. Demo tests cover one tag, rando
 2. Build and validate a slot winner detector from calibrated results cues.
 3. Test TSH 5.x adapter on a local installation and document version differences.
 4. Expand candidate ranking with stable player IDs, station assignments, and observed character distributions.
+
+## Integration references
+
+- [Tournament Stream Helper source](https://github.com/joaorb64/TournamentStreamHelper), including its local web routes in `src/TSHWebServer.py` and actions in `src/TSHWebServerActions.py`.
+- [OBS WebSocket 5 protocol](https://github.com/obsproject/obs-websocket/blob/master/docs/generated/protocol.md).
+- [Start.gg stream queue query](https://developer.start.gg/docs/examples/queries/stream-queue/) and [GraphQL request format](https://developer.start.gg/docs/sending-requests/).

@@ -105,6 +105,11 @@ class FrameDetector:
                 color = dominant_color(color_roi.crop(frame))
                 if color:
                     obs.colors[slot] = color
+            character_roi = self.calibration.rois.get(f"{slot.value.lower()}_character")
+            if do_ocr and character_roi:
+                character, confidence = self.characters.detect(character_roi.crop(frame), slot)
+                if character and confidence >= .8:
+                    obs.characters[slot] = character
         active_roi = self.calibration.rois.get("gameplay")
         if active_roi:
             crop = active_roi.crop(frame)

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from dataclasses import asdict
 
 from .config import Settings
@@ -29,6 +30,9 @@ class Controller:
         self.error: str | None = None
         self.lock = asyncio.Lock()
         self.player_data = LocalPlayerDataProvider(store)
+        self.set_complete_at: float | None = None
+        self.next_dismissed = False
+        self.auto_swapped_set_id: str | None = None
 
     async def refresh(self) -> SetInfo:
         match = await self.tsh.get_current_set()
@@ -38,7 +42,14 @@ class Controller:
             self.machine.reset()
             self.previous_mapping = self.manual_mapping = None
             self.next_candidate = None
+            self.set_complete_at = None
+            self.next_dismissed = False
+            self.auto_swapped_set_id = None
             self.store.log("set_changed", {"set_id": match.set_id})
+        if match.complete and self.set_complete_at is None:
+            self.set_complete_at = time.time()
+        elif not match.complete:
+            self.set_complete_at = None
         self.match = match
         return match
 
@@ -54,6 +65,8 @@ class Controller:
                 "phase": self.machine.phase.value, "generation": self.machine.generation,
                 "armed": self.armed, "set_mode": self.set_mode.value,
                 "swap_mode": self.swap_mode.value,
+                "swap_suggested": self.mapping.p1_is_left is False and
+                 self.mapping.confidence >= self.settings.min_mapping_confidence and not self.mapping.conflict,
                 "mapping": asdict(self.mapping), "observation": asdict(self.observation),
                 "next_candidate": self.next_candidate, "events": self.store.recent()}
 
@@ -64,6 +77,23 @@ class Controller:
             self.mapping = map_players(match, obs, self.previous_mapping)
             if self.manual_mapping is not None:
                 self.mapping = MappingDecision(self.manual_mapping, 1.0, self.mapping.evidence)
+            independent = {e.source for e in self.mapping.evidence
+                           if not e.p1_is_left and e.confidence >= .9 and e.source != "previous_mapping"}
+            if (self.swap_mode == Mode.AUTO and self.mapping.p1_is_left is False
+                    and self.mapping.confidence >= .99 and not self.mapping.conflict
+                    and len(independent) >= 2 and self.manual_mapping is None
+                    and match.left_score == match.right_score == 0
+                    and self.auto_swapped_set_id != match.set_id):
+                left_name, right_name = match.left.display_name, match.right.display_name
+                await self.tsh.swap_players()
+                check = await self.tsh.get_current_set()
+                if (check.set_id != match.set_id or check.left.display_name != right_name
+                        or check.right.display_name != left_name):
+                    raise RuntimeError("TSH player swap could not be verified")
+                self.auto_swapped_set_id = match.set_id
+                self.previous_mapping = True
+                self.mapping = MappingDecision(True, self.mapping.confidence, self.mapping.evidence)
+                self.store.log("auto_players_swapped", {"set_id": match.set_id})
             confirmed_end = self.machine.observe(obs)
             if self.mapping.p1_is_left is not None and self.mapping.confidence >= self.settings.min_mapping_confidence:
                 self.previous_mapping = self.mapping.p1_is_left
@@ -106,6 +136,8 @@ class Controller:
         self.store.finish_score(event_id, "applied")
         self.match = verified
         self.machine.phase = GamePhase.SET_COMPLETE if verified.complete else GamePhase.UPDATED
+        if verified.complete:
+            self.set_complete_at = time.time()
         self.store.log("score_applied", {"event_id": event_id, "side": side.value,
                        "before": [match.left_score, match.right_score],
                        "after": [verified.left_score, verified.right_score],
@@ -143,16 +175,21 @@ class Controller:
 
     async def suggest_next_set(self, assigned: set[str] | None = None) -> dict | None:
         candidates = await self.tsh.get_possible_sets()
+        observation = self.observation
+        if self.set_complete_at is not None and observation.timestamp <= self.set_complete_at:
+            observation = Observation()
         ranked = []
         for match in candidates:
+            await self.player_data.enrich(match.left)
+            await self.player_data.enrich(match.right)
             scores: list[tuple[float, list[str]]] = []
             for p1, p2 in ((match.left, match.right), (match.right, match.left)):
-                tag1 = tag_score(self.observation.tags.get(Slot.P1, ""), p1)
-                tag2 = tag_score(self.observation.tags.get(Slot.P2, ""), p2)
+                tag1 = tag_score(observation.tags.get(Slot.P1, ""), p1)
+                tag2 = tag_score(observation.tags.get(Slot.P2, ""), p2)
                 tag_fit = (tag1 + tag2) / 2 if min(tag1, tag2) >= .75 else max(tag1, tag2) * .8
                 character_fits = []
                 for slot, player in ((Slot.P1, p1), (Slot.P2, p2)):
-                    character = self.observation.characters.get(slot, "").casefold()
+                    character = observation.characters.get(slot, "").casefold()
                     if character and player.character_distribution:
                         character_fits.append(player.character_distribution.get(character, 0))
                 char_fit = sum(character_fits) / len(character_fits) if len(character_fits) == 2 else 0
@@ -164,9 +201,12 @@ class Controller:
                     score = max(score, .98)
                 scores.append((score, reasons))
             score, reasons = max(scores, key=lambda item: item[0])
-            if assigned and match.set_id in assigned:
+            assigned_here = (bool(assigned and match.set_id in assigned) or
+                             bool(self.settings.startgg_stream_name and match.assigned_stream and
+                                  self.settings.startgg_stream_name.casefold() in match.assigned_stream.casefold()))
+            if assigned_here:
                 score = max(score, .96)
-                reasons.append("Start.gg stream assignment")
+                reasons.append("stream assignment")
                 if score >= .75 and len(reasons) > 1:
                     score = .99
             ranked.append((score, match, reasons))
@@ -180,7 +220,12 @@ class Controller:
                                "second_best": second, "reasons": top[2]}
         self.store.log("set_candidate", self.next_candidate)
         if (self.set_mode == Mode.AUTO and top[0] >= self.settings.min_set_confidence
-                and top[0] - second >= self.settings.min_set_margin):
+                and top[0] - second >= self.settings.min_set_margin
+                and (self.set_complete_at is None or
+                     (time.time() - self.set_complete_at >= self.settings.post_set_delay_seconds
+                      and observation.timestamp >= self.set_complete_at + self.settings.post_set_delay_seconds
+                      and observation.game_active and observation.game_set is False
+                      and observation.result_screen is False))):
             await self.load_next_set()
         return self.next_candidate
 
@@ -196,4 +241,6 @@ class Controller:
         self.match = check
         self.machine.reset()
         self.next_candidate = None
+        self.set_complete_at = None
+        self.next_dismissed = False
         self.previous_mapping = self.manual_mapping = None

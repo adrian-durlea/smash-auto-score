@@ -17,13 +17,38 @@ def load_calibration(path: Path) -> Calibration:
     if not path.exists():
         return Calibration()
     data = json.loads(path.read_text(encoding="utf-8"))
+    if "profiles" in data:
+        data = data["profiles"].get(data.get("active", "Default"), {})
     return Calibration({key: ROI(**value) for key, value in data.get("rois", {}).items()})
 
 
 def save_calibration(path: Path, calibration: Calibration) -> None:
     from dataclasses import asdict
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(asdict(calibration), indent=2), encoding="utf-8")
+    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    if "profiles" not in data:
+        data = {"active": "Default", "profiles": {"Default": data or {"rois": {}}}}
+    data["profiles"][data["active"]] = asdict(calibration)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def calibration_profiles(path: Path) -> tuple[str, list[str]]:
+    if not path.exists():
+        return "Default", ["Default"]
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return (data.get("active", "Default"), list(data.get("profiles", {"Default": {}})))
+
+
+def activate_profile(path: Path, name: str) -> None:
+    if not name or len(name) > 60 or any(c in name for c in "<>/\\:"):
+        raise ValueError("Invalid profile name")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    if "profiles" not in data:
+        data = {"active": "Default", "profiles": {"Default": data or {"rois": {}}}}
+    data["profiles"].setdefault(name, {"rois": {}})
+    data["active"] = name
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 class VideoWorker:

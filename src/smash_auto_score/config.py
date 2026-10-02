@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     min_winner_confidence: float = 0.97
     min_set_confidence: float = 0.97
     min_set_margin: float = 0.20
+    post_set_delay_seconds: float = 15.0
     database_path: str = "autoscore.db"
     frame_width: int = 960
     frame_height: int = 540

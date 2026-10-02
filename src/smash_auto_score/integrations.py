@@ -166,6 +166,7 @@ class DemoTSHAdapter:
         m = self.current
         m.left, m.right = m.right, m.left
         m.left_score, m.right_score = m.right_score, m.left_score
+        m.left_color, m.right_color = m.right_color, m.left_color
 
 
 class VideoSource(Protocol):

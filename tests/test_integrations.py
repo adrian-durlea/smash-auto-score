@@ -8,7 +8,13 @@ from smash_auto_score.controller import Controller
 from smash_auto_score.domain import Mode, Observation, PlayerIdentity, SetInfo, Slot
 from smash_auto_score.integrations import DemoTSHAdapter, parse_tsh_scoreboard
 from smash_auto_score.store import Store
-from smash_auto_score.vision import WinnerDetector
+from smash_auto_score.vision import ROI, Calibration, WinnerDetector
+from smash_auto_score.worker import (
+    activate_profile,
+    calibration_profiles,
+    load_calibration,
+    save_calibration,
+)
 
 
 def test_tsh_5_scoreboard_shape():
@@ -67,3 +73,14 @@ async def test_tsh_disconnect_preserves_dashboard(tmp_path):
     status = await ctl.status()
     assert not status["connected"]
     assert status["error"] == "offline"
+
+
+def test_named_calibration_profiles(tmp_path):
+    path = tmp_path / "calibration.json"
+    save_calibration(path, Calibration({"p1_tag": ROI(.1, .2, .3, .1)}))
+    activate_profile(path, "Weekly-720p")
+    assert load_calibration(path).rois == {}
+    save_calibration(path, Calibration({"p2_hud": ROI(.5, .8, .2, .1)}))
+    assert calibration_profiles(path) == ("Weekly-720p", ["Default", "Weekly-720p"])
+    activate_profile(path, "Default")
+    assert "p1_tag" in load_calibration(path).rois
