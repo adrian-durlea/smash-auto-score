@@ -1,0 +1,78 @@
+import asyncio
+import json
+import logging
+import time
+from pathlib import Path
+
+import cv2
+
+from .controller import Controller
+from .integrations import VideoSource
+from .vision import ROI, Calibration, FrameDetector
+
+log = logging.getLogger(__name__)
+
+
+def load_calibration(path: Path) -> Calibration:
+    if not path.exists():
+        return Calibration()
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return Calibration({key: ROI(**value) for key, value in data.get("rois", {}).items()})
+
+
+def save_calibration(path: Path, calibration: Calibration) -> None:
+    from dataclasses import asdict
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(asdict(calibration), indent=2), encoding="utf-8")
+
+
+class VideoWorker:
+    def __init__(self, source: VideoSource, controller: Controller, calibration_path: Path,
+                 fps: float = 5, ocr_interval: float = 1, color_interval: float = .5):
+        self.source, self.controller, self.calibration_path = source, controller, calibration_path
+        self.fps, self.ocr_interval, self.color_interval = fps, ocr_interval, color_interval
+        self.detector = FrameDetector(load_calibration(calibration_path))
+        self.latest_frame: bytes | None = None
+        self.connected = False
+        self.error: str | None = None
+        self._last_ocr = 0.0
+        self._last_color = 0.0
+
+    def reload_calibration(self) -> None:
+        self.detector.calibration = load_calibration(self.calibration_path)
+
+    async def run(self) -> None:
+        while True:
+            started = time.monotonic()
+            try:
+                frame = await self.source.frame()
+                self.connected = True
+                self.error = None
+                ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                if ok:
+                    self.latest_frame = encoded.tobytes()
+                now = time.monotonic()
+                do_ocr = now - self._last_ocr >= self.ocr_interval
+                do_color = now - self._last_color >= self.color_interval
+                obs = await asyncio.to_thread(self.detector.observe, frame,
+                                              do_ocr=do_ocr, do_color=do_color)
+                if not do_ocr:
+                    obs.game_set = None
+                    obs.result_screen = None
+                obs.timestamp = time.time()
+                if do_ocr:
+                    self._last_ocr = now
+                if do_color:
+                    self._last_color = now
+                await self.controller.ingest(obs)
+            except EOFError:
+                self.connected = False
+                self.error = "Recording ended"
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - video source must reconnect
+                self.connected = False
+                self.error = str(exc)
+                log.warning("Video cycle failed: %s", exc)
+            await asyncio.sleep(max(0.05, 1 / self.fps - (time.monotonic() - started)))
